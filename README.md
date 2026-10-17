@@ -59,7 +59,7 @@ chat-parser patch in `patches/` is applied to the submodule at configure time.
 | Reasoning | returned as `reasoning_content`; `"reasoning_effort": "none"` turns it off |
 | Tools | OpenAI format (`tools`, `tool_calls`) |
 | Images | with `--mmproj`, OpenAI `image_url` parts holding a base64 `data:image/...` URL (PNG, JPEG, BMP or GIF), several per message |
-| Not supported | more than one GPU, batch requests |
+| Not supported | batch requests; the engine's layer split across cards (`--gpus`/`--layer-split`) - a second GPU is supported as the peer expert tier (`--peer-device`) |
 
 Images: `--mmproj /models/mmproj-Qwen3.8-Flash-Next-BF16.gguf` loads the model's own vision encoder (from the same
 Hugging Face repository as the GGUF; 0.9 GB). The encoder runs on the CPU, so the card keeps its expert cache:

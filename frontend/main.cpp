@@ -16,6 +16,11 @@
 
 #include <cpp-httplib/httplib.h>
 
+// the peer tier's ordinal check and P2P probe: this file is only built with the CUDA targets on (the
+// unbiased-strata target needs the engine), and the engine child execs, so CUDA state in this process cannot
+// reach it (frontend/engine.hpp: start() forks and execv's /proc/self/exe)
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -62,6 +67,14 @@ struct Options {
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
     long long vram_cap_mib = 0;         // --vram-cap: the engine limits itself to a smaller card's VRAM
     double ram_cap_gib = 0.0;           // --ram-cap: bounds the engine's RAM expert tier and pinned arena
+    // the engine's peer expert tier (PLAN-dual-gpu.md): a second GPU beside the primary, holding the expert
+    // slots the primary does not.  Mapped 1:1 to the engine's --peer-* options, but validated and defaulted
+    // here so a bad ordinal or a no-P2P default is caught before the engine loads anything.
+    int peer_device = -1;               // --peer-device N: the peer card's CUDA ordinal (-1 = off)
+    int peer_reserve_mib = 0;           // --peer-reserve-mib: 0 = this front end's default (2500), not the engine's 600
+    long long peer_slots = 0;           // --peer-slots: 0 = what fits on the peer
+    int peer_adapt_swaps = -1;          // --peer-adapt-swaps: -1 = the engine's --adapt-swaps
+    long long peer_prefill_rows = -1;   // --peer-prefill-rows: -1 = the engine's default; 0 = the prompt stays on the primary
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
 
@@ -79,7 +92,16 @@ void usage() {
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
         "  --port N        port to listen on (default 8080)\n"
         "  --vram-cap MIB  emulate a smaller card: the engine uses at most MIB of VRAM (a 1080 Ti as 6 GB: 5722)\n"
-        "  --ram-cap GIB   bound the engine's RAM expert tier and pinned arena to GIB\n\n"
+        "  --ram-cap GIB   bound the engine's RAM expert tier and pinned arena to GIB\n"
+        "  --peer-device N   a second GPU as an adaptive expert-cache tier: the hottest experts stay on the\n"
+        "                    primary card, the next slice on GPU N, the rest in RAM.  N is the peer's CUDA\n"
+        "                    ordinal (pin the ordinals: CUDA_DEVICE_ORDER=PCI_BUS_ID); without P2P between\n"
+        "                    the two cards the prompt path stays on the primary GPU\n"
+        "  --peer-reserve-mib N  VRAM the peer leaves free on its card (default 2500: a card driving a desktop)\n"
+        "  --peer-slots N    expert slots on the peer (default: what fits)\n"
+        "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: the engine's --adapt-swaps)\n"
+        "  --peer-prefill-rows N  prompt rows per layer the peer computes (0 = the prompt path stays on the\n"
+        "                    primary; default 0 without P2P, else the engine's default)\n\n"
         "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health (with the\n"
         "engine's expert tiers and per-token counters: VRAM slots, RAM copies, mapped experts, hits, warm hints,\n"
         "major page faults).\n");
@@ -626,14 +648,28 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
         else if (a == "--vram-cap") o.vram_cap_mib = std::atoll(next("--vram-cap").c_str());
         else if (a == "--ram-cap") o.ram_cap_gib = std::atof(next("--ram-cap").c_str());
+        else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device").c_str());
+        else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib").c_str());
+        else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots").c_str());
+        else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps").c_str());
+        else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows").c_str());
         else if (a == "--") {
             for (++i; i < argc; ++i) {
                 const std::string e = argv[i];
-                // one GPU only: the engine's multi-GPU and remote-expert modes are not part of this fork
-                for (const char* no : {"--gpus", "--layer-split", "--split-device", "--peer-device", "--peer-slots",
-                                       "--remote-expert", "--vision", "--batch"})
+                // the multi-GPU modes this front end does not drive stay out: a layer split pools context but
+                // halves this rig's decode speed, and the remote-expert tiers are the engine's own knobs
+                for (const char* no : {"--gpus", "--layer-split", "--split-device", "--remote-expert", "--vision",
+                                       "--batch"})
                     if (e.rfind(no, 0) == 0) {
                         std::fprintf(stderr, "unbiased-strata: %s is not supported here (use --mmproj for image input)\n", e.c_str());
+                        std::exit(2);
+                    }
+                // the peer tier is this front end's own option set (validated and defaulted here): a --peer-*
+                // knob after -- would race the front end's defaults, so it belongs before --
+                for (const char* no : {"--peer-device", "--peer-reserve-mib", "--peer-slots", "--peer-adapt-swaps",
+                                       "--peer-prefill-rows"})
+                    if (e.rfind(no, 0) == 0) {
+                        std::fprintf(stderr, "unbiased-strata: %s is a front-end option here: pass it before --\n", e.c_str());
                         std::exit(2);
                     }
                 o.extra.push_back(e);
@@ -672,6 +708,54 @@ int main(int argc, char** argv) {
     if (!o.mmproj.empty() && (!file_exists(o.mmproj) || o.vision_tokens < 16 || o.vision_tokens > 4096)) {
         std::fprintf(stderr, "unbiased-strata: --mmproj must exist and --vision-tokens must be 16..4096\n"); return 2;
     }
+    // the peer tier (a second GPU as an adaptive expert cache): validate the ordinal and probe P2P here, in the
+    // parent, before the engine loads anything - a bad ordinal or a no-P2P default is a decision to make before
+    // a 40 GB load, not after it (PLAN-dual-gpu.md Phase 0).  The probe is host-side only; whatever context a
+    // query may have made is dropped below, so the server process holds no VRAM while the engine runs.
+    bool peer_p2p = false;
+    if (o.peer_device != -1) {
+        if (o.peer_device < 1) {
+            std::fprintf(stderr, "unbiased-strata: --peer-device is the peer card's CUDA ordinal (1 or higher; 0 is\n"
+                                 "the primary; pin the ordinals with CUDA_DEVICE_ORDER=PCI_BUS_ID)\n");
+            return 2;
+        }
+    } else if (o.peer_reserve_mib != 0 || o.peer_slots != 0 || o.peer_adapt_swaps != -1 || o.peer_prefill_rows != -1) {
+        std::fprintf(stderr, "unbiased-strata: --peer-reserve-mib/--peer-slots/--peer-adapt-swaps/"
+                             "--peer-prefill-rows need --peer-device\n");
+        return 2;
+    }
+    if (o.peer_device >= 1) {
+        if (o.peer_reserve_mib < 0) { std::fprintf(stderr, "unbiased-strata: --peer-reserve-mib must be 0 or more\n"); return 2; }
+        if (o.peer_slots < 0) { std::fprintf(stderr, "unbiased-strata: --peer-slots must be 0 or more (0 = what fits)\n"); return 2; }
+        if (o.peer_prefill_rows < -1) {
+            std::fprintf(stderr, "unbiased-strata: --peer-prefill-rows must be 0 (the prompt stays on the primary) or more\n");
+            return 2;
+        }
+        int count = 0;
+        const cudaError_t ce = cudaGetDeviceCount(&count);
+        if (ce != cudaSuccess || count < 1) {
+            std::fprintf(stderr, "unbiased-strata: --peer-device: no CUDA device is visible (%s)\n", cudaGetErrorString(ce));
+            return 2;
+        }
+        if (o.peer_device >= count) {
+            std::fprintf(stderr, "unbiased-strata: --peer-device %d: only %d CUDA %s visible; pin the ordinals with\n"
+                                 "CUDA_DEVICE_ORDER=PCI_BUS_ID or set CUDA_VISIBLE_DEVICES\n",
+                         o.peer_device, count, count == 1 ? "device is" : "devices are");
+            return 2;
+        }
+        int fwd = 0, back = 0;
+        cudaDeviceCanAccessPeer(&fwd, 0, o.peer_device);
+        cudaDeviceCanAccessPeer(&back, o.peer_device, 0);
+        peer_p2p = fwd != 0 && back != 0;
+        std::fprintf(stderr, "unbiased-strata: peer GPU %d: %s between the cards - %s\n", o.peer_device,
+                     peer_p2p ? "direct access (P2P)" : "no P2P",
+                     peer_p2p ? "the peer also computes prompt rows (--peer-prefill-rows overrides)"
+                              : "the prompt path stays on the primary GPU; decode still gains the peer's experts");
+        for (int d : {0, o.peer_device}) {   // drop any context the probe may have made on either card
+            cudaSetDevice(d);
+            cudaDeviceReset();
+        }
+    }
     // the engine, started first: loading takes minutes, and it must be forked before any thread exists
     std::vector<std::string> eargs = {
         "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model,
@@ -680,6 +764,20 @@ int main(int argc, char** argv) {
     if (!shard2.empty()) { eargs.push_back("--ple-gguf"); eargs.push_back(shard2); eargs.push_back("--ple-io"); eargs.push_back("ram"); }
     if (o.vram_cap_mib > 0) { eargs.push_back("--vram-cap"); eargs.push_back(std::to_string(o.vram_cap_mib)); }
     if (o.ram_cap_gib > 0.0) { eargs.push_back("--ram-cap"); eargs.push_back(std::to_string(o.ram_cap_gib)); }
+    if (o.peer_device >= 1) {
+        eargs.push_back("--peer-device"); eargs.push_back(std::to_string(o.peer_device));
+        // the peer is a desktop card on this rig's kind of host: leave it more free VRAM than the engine's 600
+        eargs.push_back("--peer-reserve-mib");
+        eargs.push_back(std::to_string(o.peer_reserve_mib > 0 ? o.peer_reserve_mib : 2500));
+        if (o.peer_slots > 0) { eargs.push_back("--peer-slots"); eargs.push_back(std::to_string(o.peer_slots)); }
+        if (o.peer_adapt_swaps >= 0) { eargs.push_back("--peer-adapt-swaps"); eargs.push_back(std::to_string(o.peer_adapt_swaps)); }
+        // without P2P the peer cannot take prompt rows: say so up front instead of relying on the engine's
+        // own fallback when the prompt path is first built
+        if (o.peer_prefill_rows >= 0 || !peer_p2p) {
+            eargs.push_back("--peer-prefill-rows");
+            eargs.push_back(std::to_string(o.peer_prefill_rows >= 0 ? o.peer_prefill_rows : 0));
+        }
+    }
     if (!o.mmproj.empty()) eargs.push_back("--vision");
     if (o.ctx > 8192) { eargs.push_back("--kv"); eargs.push_back("int8"); }
     if (o.threads <= 0) {
