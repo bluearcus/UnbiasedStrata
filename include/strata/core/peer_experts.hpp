@@ -74,6 +74,7 @@ public:
     void apply_pending(bool wait);
 
     int64_t resident() const { return resident_; }
+    int64_t slots() const { return cache_.slots(); }   ///< the tier's slot count (0 before open)
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
     bool launched_direct() const { return launched_direct_; }
     double gib() const { return cache_.gib(); }

@@ -717,9 +717,12 @@ void usage() {
                  "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
-                 "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
-                 "                       computes its experts' prompt rows).  Not with --layer-split or\n"
-                 "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
+                 "  --peer-device N      a second GPU as an adaptive expert-cache tier.  Its decode rows come\n"
+                 "                       back through pinned host rows, so they need no P2P; with P2P between the\n"
+                 "                       cards it also computes its experts' prompt rows (--peer-prefill-rows),\n"
+                 "                       without P2P the prompt path stays on the primary GPU.  Not with\n"
+                 "                       --layer-split or --expert-cache-device1..3.  Default output unchanged\n"
+                 "                       without it.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
@@ -4003,6 +4006,14 @@ int main(int argc, char** argv) {
                              "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        // the P2P probe's verdict, so the user can tell which path the prompt takes: the decode tier needs no P2P
+        // (its rows come back through pinned host rows), the prompt-side helper does - without it the prompt path
+        // stays on the primary GPU (generate.cpp's prefill peer, which refuses without P2P)
+        std::fprintf(stderr, "strata generate: peer GPU %d: p2p %s between the cards - %s\n", o.peer_device,
+                     peer.p2p() ? "yes" : "no",
+                     peer.p2p() ? "the peer also computes its experts' prompt rows (--peer-prefill-rows bounds them; "
+                                  "0 keeps the prompt path on the primary)"
+                                : "the prompt path stays on the primary GPU (decode still gains the peer's tier)");
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
@@ -6129,10 +6140,12 @@ int main(int argc, char** argv) {
             p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
         };
-        // The tier census and the per-token counters, one JSON line: VRAM slots (and how many hold an expert), RAM copies,
-        // experts mapped from the file; then the counters since start: tokens served, VRAM hits (`cache_hits`), RAM-copy
-        // reads, file reads, warm hints (`FileExpertSource::warm`), and the process's major page faults from
-        // /proc/self/stat (the disk-read proxy: a page-cache miss on a mapped expert is not otherwise observable).
+        // The tier census and the per-token counters, one JSON line: VRAM slots (and how many hold an expert), the
+        // peer tier's own slots/held/hits/wait/p2p (zeros without a peer; its experts are also in the arena or the
+        // file, so it is a tier on top of ram_copies/mapped, not a change to them), RAM copies, experts mapped from
+        // the file; then the counters since start: tokens served, VRAM hits (`cache_hits`), RAM-copy reads, file
+        // reads, warm hints (`FileExpertSource::warm`), and the process's major page faults from /proc/self/stat
+        // (the disk-read proxy: a page-cache miss on a mapped expert is not otherwise observable).
         const uint64_t faults0 = mem_sample().faults;
         int64_t served_tokens = 0;
         auto tier_stats = [&]() -> std::string {
@@ -6140,13 +6153,19 @@ int main(int argc, char** argv) {
             const int64_t vram_slots = xcache.slots(), vram_held = xcache.resident();
             const int64_t ram_copies = src.complement_count();
             const int64_t mapped = std::max<int64_t>(total - vram_held - ram_copies, 0);
+            const int64_t peer_slots = peer.slots(), peer_held = peer.resident(), peer_hits = peer.entries();
             const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-            char buf[768];
+            char buf[960];
             std::snprintf(buf, sizeof buf,
-                          "STATS {\"experts\":%lld,\"vram_slots\":%lld,\"vram_held\":%lld,\"ram_copies\":%lld,\"mapped\":%lld,"
+                          "STATS {\"experts\":%lld,\"vram_slots\":%lld,\"vram_held\":%lld,\"peer_slots\":%lld,"
+                          "\"peer_held\":%lld,\"peer_hits\":%lld,\"peer_ms_wait\":%.1f,\"peer_p2p\":%s,"
+                          "\"ram_copies\":%lld,\"mapped\":%lld,"
                           "\"mean_blob\":%llu,\"tokens\":%lld,\"vram_hits\":%lld,\"lookups\":%lld,\"ram_reads\":%lld,"
                           "\"file_reads\":%lld,\"file_mb\":%.1f,\"warm_hints\":%lld,\"major_faults\":%llu,\"max_context\":%lld}",
-                          (long long) total, (long long) vram_slots, (long long) vram_held, (long long) ram_copies,
+                          (long long) total, (long long) vram_slots, (long long) vram_held,
+                          (long long) peer_slots, (long long) peer_held, (long long) peer_hits,
+                          peer.ms_wait, peer.p2p() ? "true" : "false",
+                          (long long) ram_copies,
                           (long long) mapped, (unsigned long long) (lay.native && total > 0 ? lay.total / (uint64_t) total : lay.max_blob),
                           (long long) served_tokens, (long long) drive.d.cache_hits,
                           (long long) (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused),
