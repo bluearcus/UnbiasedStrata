@@ -274,6 +274,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(vram_plan_test tests/core/vram_plan_test.cpp)
   target_link_libraries(vram_plan_test PRIVATE strata_plan)
   add_test(NAME vram_plan_test COMMAND vram_plan_test)
+
+  # PLAN-dual-gpu.md Phase 0: dry-run the dual-asymmetric-GPU (3090 + 4070) peer-tier sizing, GPU-free
+  add_executable(dual_gpu_plan_check tools/dual_gpu_plan_check.cpp)
+  target_link_libraries(dual_gpu_plan_check PRIVATE strata_plan)
+  add_test(NAME dual_gpu_plan_check COMMAND dual_gpu_plan_check)
 endif()
 
 # ---- strata_core (GPU runtime) ---------------------------------------------
