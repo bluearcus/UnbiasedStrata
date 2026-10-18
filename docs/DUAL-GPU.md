@@ -47,6 +47,18 @@ Notes:
   4.0 x4 slot its staging shares that link (~1.5 MB/token each way at 30% peer ownership — fine against a
   ~10 ms decode step; watch `peer_ms_wait` in `/health`).
 
+## Upward tier movement (promotion pass)
+
+The two VRAM tiers never exchange residency directly. Instead, each adapt round opens with a promotion pass:
+a peer-held expert whose heat ranks inside the **top third** of its layer's primary residents is evicted to CPU
+coverage, which makes it an ordinary primary candidate in the same round — and the primary's gain-sorted
+admission pulls it up to the faster card when it beats a victim there. Weights always come from the host
+source. Three guards: the nominee must also beat the layer's worst primary resident by the standard 1.5
+margin (so it is actually admitted, not stranded on the CPU), at most `adapt_swaps` nominations per round,
+and an 8-round cooldown before re-nomination. `peer_nominated` in `/health` counts the cumulative upward
+moves. Net effect: the fast card converges back toward holding the hottest experts even when the conversation
+drifts off-profile, without a restart.
+
 ## Observability
 
 * Startup prints the probe verdict (`peer GPU 1: no P2P ...`) and the engine logs `p2p yes|no` with what it
