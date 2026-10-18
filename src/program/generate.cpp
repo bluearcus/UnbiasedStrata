@@ -25,6 +25,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/vram_cap.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/model_geometry.hpp"
@@ -118,22 +119,30 @@ bool under_wddm() {
 #endif
 }
 
-// --vram-cap MIB (Qwen3.6 port, step 2; Maya's STRATA_GLM_VRAM_GB idea): the engine limits its own VRAM to a smaller
-// card's, so the 1080 Ti emulates the 6 and 8 GB rungs and a 48 GB card the 12, 16 and 32 GB ones.  Two halves: every
-// free figure the planners read is clamped to `cap - used` here (so the expert cache is sized as the smaller card
-// would size it), and a blocker of `total - cap` is allocated at start (main, before the weight arena), so the driver
-// is under the pressure the real card would be under.  0 = no cap.
-int64_t g_vram_cap_bytes = 0;
-uint64_t g_vram_blocker_bytes = 0;   // the blocker's own allocation, which `used` below must not count twice
+// --vram-cap N | D:MIB,... (Qwen3.6 port, step 2; Phase 3 per-device): the engine limits its own VRAM to a smaller
+// card's, so the 1080 Ti emulates the 6 and 8 GB rungs and a 48 GB card the 12, 16 and 32 GB ones.  Two halves:
+// every free figure the planners read is clamped to `cap - used` on the current device (so the expert cache is
+// sized as the smaller card would size it), and a blocker of `total - cap` is allocated at start on each capped
+// device (main, before the weight arena), so the driver is under the pressure the real card would be under.  A
+// single N caps every card; D:MIB pairs cap one ordinal each (the 3090 + 4070: 0:22000,1:10000).  Empty = no cap.
+// The maps live here (the engine's TU); the peer tier reads its own entries through PeerExperts::open's arguments,
+// so there is no cross-TU state: vram_info clamps the primary's figures, open() clamps the peer's.
+std::map<int, int64_t> g_vram_cap_mibs;   // CUDA ordinal (or -1 = every card) -> MiB
+std::map<int, uint64_t> g_vram_blocker_bytes;   // CUDA ordinal -> the blocker's own bytes (never double-counted)
+std::vector<void*> g_vram_blockers;      // kept alive for the engine's lifetime
 cudaError_t vram_info(size_t* free_b, size_t* total_b) {
     const cudaError_t e = cudaMemGetInfo(free_b, total_b);
-    if (e == cudaSuccess && g_vram_cap_bytes > 0 && *total_b > 0) {
-        // this process AND every other one, minus the blocker: the blocker already took `total - cap` out of
-        // `free`, so counting it in `used` as well subtracted it twice (room went negative at --vram-cap 5722)
-        const uint64_t all = *total_b > *free_b ? *total_b - *free_b : 0;
-        const uint64_t used = all > g_vram_blocker_bytes ? all - g_vram_blocker_bytes : 0;
-        const uint64_t room = (uint64_t) g_vram_cap_bytes > used ? (uint64_t) g_vram_cap_bytes - used : 0;
-        if (*free_b > room) *free_b = (size_t) room;
+    if (e == cudaSuccess && !g_vram_cap_mibs.empty() && *total_b > 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+        const int64_t cap_mib = strata::core::vram_cap_mib_for(g_vram_cap_mibs, dev);
+        if (cap_mib > 0) {
+            auto it = g_vram_blocker_bytes.find(dev);
+            const uint64_t blocker = it != g_vram_blocker_bytes.end() ? it->second : 0;
+            // this process AND every other one, minus the blocker (see vram_cap.hpp: vram_capped_free)
+            const uint64_t all = *total_b > *free_b ? *total_b - *free_b : 0;
+            *free_b = (size_t) strata::core::vram_capped_free(*free_b, all, (uint64_t) cap_mib, blocker);
+        }
     }
     return e;
 }
@@ -445,9 +454,10 @@ struct Options {
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
     bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
-    /// Qwen3.6 port, step 2 (docs/QWEN36-35B-A3B.md 4.2 item 4): --vram-cap MIB limits this engine's VRAM to a smaller
-    /// card's (the free figures clamped, a blocker allocated); --ram-cap GIB bounds the RAM tier and the pinned arena.
-    int64_t vram_cap_mib = 0;
+    /// Qwen3.6 port, step 2 (docs/QWEN36-35B-A3B.md 4.2 item 4) + Phase 3 per-device: --vram-cap N | D:MIB,...
+    /// limits this engine's VRAM to a smaller card's (the free figures clamped per current device, a blocker
+    /// allocated on each capped card); --ram-cap GIB bounds the RAM tier and the pinned arena.
+    std::string vram_cap;
     double ram_cap_gib = 0.0;
     /// #533 (opt-in): the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
@@ -648,9 +658,11 @@ void usage() {
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
-                 "  --vram-cap MIB       emulate a smaller card: this engine uses at most MIB of VRAM (the free figures it\n"
-                 "                       plans from are clamped and a blocker holds the rest), so a 1080 Ti can be run\n"
-                 "                       as a 6 GB card (5722) or an A6000 as a 16 GB one (15258)\n"
+                 "  --vram-cap N|D:MIB,...  emulate smaller cards: one cap for every card (a 1080 Ti as 6 GB:\n"
+                 "                       5722; an A6000 as 16 GB: 15258) or one per CUDA ordinal on an asymmetric\n"
+                 "                       rig (the 3090 + 4070: 0:22000,1:10000).  The free figures each card plans\n"
+                 "                       from are clamped to its own cap and a blocker holds the rest back, so each\n"
+                 "                       card is sized as the smaller card would size it\n"
                  "  --ram-cap GIB        bound the RAM expert tier (--resident-*) and the pinned arena to GIB\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -1433,8 +1445,13 @@ int main(int argc, char** argv) {
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-cap") {
-            o.vram_cap_mib = std::atoll(next("--vram-cap"));
-            if (o.vram_cap_mib <= 0) { std::fprintf(stderr, "strata generate: --vram-cap needs MiB > 0\n"); return 2; }
+            const std::string s = next("--vram-cap");
+            std::string perr;
+            if (!strata::core::parse_vram_cap(s, g_vram_cap_mibs, perr)) {
+                std::fprintf(stderr, "strata generate: %s\n", perr.c_str());
+                return 2;
+            }
+            o.vram_cap = s;
         }
         else if (a == "--ram-cap") {
             o.ram_cap_gib = std::atof(next("--ram-cap"));
@@ -2129,49 +2146,70 @@ int main(int argc, char** argv) {
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // --vram-cap: the blocker, allocated before anything else of this engine is, so every later figure (and the
-    // driver's own pressure) is the smaller card's.  `vram_info` clamps the free figures from here on.
-    if (o.vram_cap_mib > 0) {
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-            std::fprintf(stderr, "strata generate: --vram-cap: cudaMemGetInfo failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+    // driver's own pressure) is the smaller card's.  `vram_info` clamps the free figures from here on, per current
+    // device.  A single N caps every visible card; D:MIB pairs cap one ordinal each.
+    if (!o.vram_cap.empty()) {
+        int ndev = 0;
+        if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) {
+            std::fprintf(stderr, "strata generate: --vram-cap: no CUDA device is visible\n");
             return 1;
         }
-        const uint64_t cap = (uint64_t) o.vram_cap_mib << 20;
-        const uint64_t used = total_b - free_b;
-        if (cap >= total_b) {
-            std::fprintf(stderr, "strata generate: --vram-cap %lld MiB is not below this card's %llu MiB: no cap\n",
-                         (long long) o.vram_cap_mib, (unsigned long long) (total_b >> 20));
-        } else {
+        int cur = 0;
+        (void) cudaGetDevice(&cur);
+        for (int dev = 0; dev < ndev; ++dev) {
+            const int64_t cap_mib = strata::core::vram_cap_mib_for(g_vram_cap_mibs, dev);
+            if (cap_mib <= 0) continue;
+            if (cudaSetDevice(dev) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: --vram-cap: cannot select CUDA device %d\n", dev);
+                (void) cudaSetDevice(cur);
+                return 1;
+            }
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: --vram-cap: cudaMemGetInfo failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                (void) cudaSetDevice(cur);
+                return 1;
+            }
+            const uint64_t cap = (uint64_t) cap_mib << 20;
+            const uint64_t used = total_b > free_b ? total_b - free_b : 0;
+            if (cap >= total_b) {
+                std::fprintf(stderr, "strata generate: --vram-cap %lld MiB is not below card %d's %llu MiB: no cap there\n",
+                             (long long) cap_mib, dev, (unsigned long long) (total_b >> 20));
+                continue;
+            }
             void* blocker = nullptr;
             const uint64_t hold = total_b - cap;   // what a card of `cap` would not have
             if (hold > free_b || cudaMalloc(&blocker, (size_t) hold) != cudaSuccess) {
                 (void) cudaGetLastError();
-                std::fprintf(stderr, "strata generate: --vram-cap %lld MiB: cannot hold back %llu MiB of this card's %llu "
-                                     "(%llu MiB free, %llu used by other programs)\n", (long long) o.vram_cap_mib,
-                             (unsigned long long) (hold >> 20), (unsigned long long) (total_b >> 20),
+                std::fprintf(stderr, "strata generate: --vram-cap %lld MiB: cannot hold back %llu MiB of card %d's %llu "
+                                     "(%llu MiB free, %llu used by other programs)\n", (long long) cap_mib,
+                             (unsigned long long) (hold >> 20), dev, (unsigned long long) (total_b >> 20),
                              (unsigned long long) (free_b >> 20), (unsigned long long) (used >> 20));
+                (void) cudaSetDevice(cur);
                 return 1;
             }
-            g_vram_cap_bytes = (int64_t) cap;
-            g_vram_blocker_bytes = hold;
+            g_vram_blocker_bytes[dev] = hold;
+            g_vram_blockers.push_back(blocker);
             size_t f2 = 0, t2 = 0;
             vram_info(&f2, &t2);
             // what a card of `cap` would show free with the same other programs on it; the driver may round the
             // blocker up by a few MiB, so the figure is a bound, not an identity
             const uint64_t expect = cap > used ? cap - used : 0;
-            std::fprintf(stderr, "strata generate: --vram-cap %lld MiB: %llu MiB of this %llu MiB card held back; %llu MiB "
-                                 "free to this engine (the other %llu MiB were in use before it started; a %llu MiB card "
+            std::fprintf(stderr, "strata generate: --vram-cap %lld MiB on card %d: %llu MiB of this %llu MiB card held back; "
+                                 "%llu MiB free to this engine (the other %llu MiB were in use before it started; a %llu MiB card "
                                  "would show %llu)\n",
-                         (long long) o.vram_cap_mib, (unsigned long long) (hold >> 20), (unsigned long long) (total_b >> 20),
+                         (long long) cap_mib, dev, (unsigned long long) (hold >> 20), (unsigned long long) (total_b >> 20),
                          (unsigned long long) (f2 >> 20), (unsigned long long) (used >> 20), (unsigned long long) (cap >> 20),
                          (unsigned long long) (expect >> 20));
             if (f2 > expect || expect - f2 > (64ull << 20)) {
                 std::fprintf(stderr, "strata generate: --vram-cap: the free figure after the blocker is %llu MiB, not the "
                                      "%llu MiB a card of the cap would have: the clamp is wrong\n",
                              (unsigned long long) (f2 >> 20), (unsigned long long) (expect >> 20));
+                (void) cudaSetDevice(cur);
                 return 1;
             }
         }
+        (void) cudaSetDevice(cur);
     }
     // --ram-cap: the RAM tier (--resident-*) and the pinned arena see at most this much host memory
     if (o.ram_cap_gib > 0.0) {
@@ -3997,8 +4035,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         const auto tp0 = Clock::now();
+        // the peer sizes itself from its own card's figures: its --vram-cap entry and blocker, when set
+        const int64_t peer_cap = strata::core::vram_cap_mib_for(g_vram_cap_mibs, o.peer_device);
+        auto bit = g_vram_blocker_bytes.find(o.peer_device);
+        const uint64_t peer_blocker = bit != g_vram_blocker_bytes.end() ? bit->second : 0;
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
-                       err)) {
+                       err, peer_cap, peer_blocker)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

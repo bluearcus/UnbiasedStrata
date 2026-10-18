@@ -37,6 +37,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -65,7 +66,8 @@ struct Options {
     int port = 8080;
     long long ctx = 32768;
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
-    long long vram_cap_mib = 0;         // --vram-cap: the engine limits itself to a smaller card's VRAM
+    std::string vram_cap;               // --vram-cap N | D:MIB,...: a single cap or one per CUDA ordinal (Phase 3;
+                                        // verbatim to the engine, which parses it; empty = no cap)
     double ram_cap_gib = 0.0;           // --ram-cap: bounds the engine's RAM expert tier and pinned arena
     // the engine's peer expert tier (PLAN-dual-gpu.md): a second GPU beside the primary, holding the expert
     // slots the primary does not.  Mapped 1:1 to the engine's --peer-* options, but validated and defaulted
@@ -91,7 +93,8 @@ void usage() {
         "                  or half the CPU quota inside a container that has one)\n"
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
         "  --port N        port to listen on (default 8080)\n"
-        "  --vram-cap MIB  emulate a smaller card: the engine uses at most MIB of VRAM (a 1080 Ti as 6 GB: 5722)\n"
+        "  --vram-cap MIB|D:MIB,...  emulate a smaller card: one cap for every card (a 1080 Ti as 6 GB: 5722)\n"
+        "                    or one per CUDA ordinal on an asymmetric rig (the 3090 + 4070: 0:22000,1:10000)\n"
         "  --ram-cap GIB   bound the engine's RAM expert tier and pinned arena to GIB\n"
         "  --peer-device N   a second GPU as an adaptive expert-cache tier: the hottest experts stay on the\n"
         "                    primary card, the next slice on GPU N, the rest in RAM.  N is the peer's CUDA\n"
@@ -646,7 +649,29 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--port") o.port = std::atoi(next("--port").c_str());
         else if (a == "--ctx") o.ctx = std::atoll(next("--ctx").c_str());
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
-        else if (a == "--vram-cap") o.vram_cap_mib = std::atoll(next("--vram-cap").c_str());
+        else if (a == "--vram-cap") {
+            o.vram_cap = next("--vram-cap");
+            // validated here, parsed by the engine: a bare number, or D:MIB pairs per CUDA ordinal
+            const char* s = o.vram_cap.c_str();
+            bool ok = *s != '\0';
+            while (ok && *s) {
+                char* e = nullptr;
+                const long d = std::strtol(s, &e, 10);
+                if (e == s || d < 0) { ok = false; break; }
+                if (*e == ':') {
+                    if (d > 7) { ok = false; break; }
+                    s = e + 1;
+                    char* e2 = nullptr;
+                    const long m = std::strtol(s, &e2, 10);
+                    if (e2 == s || m <= 0) { ok = false; break; }
+                    s = e2;
+                } else if (d <= 0) { ok = false; break; }
+                else s = e;
+                if (*s == ',') ++s;
+                else if (*s) { ok = false; break; }
+            }
+            if (!ok) { std::fprintf(stderr, "unbiased-strata: --vram-cap needs MIB or D:MIB,... (e.g. 5722 or 0:22000,1:10000)\n"); return false; }
+        }
         else if (a == "--ram-cap") o.ram_cap_gib = std::atof(next("--ram-cap").c_str());
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device").c_str());
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib").c_str());
@@ -761,8 +786,18 @@ int main(int argc, char** argv) {
         "unbiased-strata", "--engine", "--serve", "--pack", o.pack, "--native", o.model,
         "--expert-profile", profile, "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
         "--mtp", o.mtp, "--max-context", std::to_string(o.ctx)};
-    if (!shard2.empty()) { eargs.push_back("--ple-gguf"); eargs.push_back(shard2); eargs.push_back("--ple-io"); eargs.push_back("ram"); }
-    if (o.vram_cap_mib > 0) { eargs.push_back("--vram-cap"); eargs.push_back(std::to_string(o.vram_cap_mib)); }
+    if (!shard2.empty()) {
+        eargs.push_back("--ple-gguf"); eargs.push_back(shard2);
+        // Upstream's own default is --ple-io direct (the table stays on the SSD); the fork hard-codes ram.
+        // Under a peer the automatic low-RAM fallback is skipped, so on a host the arena + table does not fit
+        // the hard-coded ram is a guaranteed OOM: default to direct.  A --ple-io in extra wins (last-wins
+        // parser), so an explicit choice is left alone.  Without a peer the historical ram default is kept
+        // (the engine's auto fallback handles a small host).
+        bool ple_overridden = false;
+        for (const std::string& e : o.extra) ple_overridden = ple_overridden || e.rfind("--ple-io", 0) == 0;
+        if (!ple_overridden) { eargs.push_back("--ple-io"); eargs.push_back(o.peer_device >= 1 ? "direct" : "ram"); }
+    }
+    if (!o.vram_cap.empty()) { eargs.push_back("--vram-cap"); eargs.push_back(o.vram_cap); }
     if (o.ram_cap_gib > 0.0) { eargs.push_back("--ram-cap"); eargs.push_back(std::to_string(o.ram_cap_gib)); }
     if (o.peer_device >= 1) {
         eargs.push_back("--peer-device"); eargs.push_back(std::to_string(o.peer_device));
@@ -788,6 +823,36 @@ int main(int argc, char** argv) {
     }
     if (o.threads > 0) { eargs.push_back("--pool-workers"); eargs.push_back(std::to_string(o.threads)); }
     for (const std::string& e : o.extra) eargs.push_back(e);
+    // The low-RAM tier under a peer (PLAN-dual-gpu.md Phase 2, item 7): the engine's automatic arena-to-mmap
+    // fallback is skipped with a peer, so on a host the resident arena does not fit the front end must pass the
+    // tier explicitly.  Below ~56 GiB of total RAM the arena + overhead + desktop do not fit even with the PLE on
+    // the SSD, so the experts stay mapped from the file and the hottest are copied to RAM by profile rank (the
+    // engine degrades to plain mmap when even those do not fit).  Explicit --mmap-experts / --resident-experts /
+    // --resident-budget-gib / --shared-expert-arena in extra win over this default.  On the 64 GB rig this branch
+    // does not trigger: the arena is the supported configuration there.
+    if (o.peer_device >= 1) {
+        bool ram_overridden = false;
+        for (const std::string& e : o.extra)
+            ram_overridden = ram_overridden || e.rfind("--mmap-experts", 0) == 0 ||
+                             e.rfind("--resident-experts", 0) == 0 || e.rfind("--resident-budget-gib", 0) == 0 ||
+                             e.rfind("--shared-expert-arena", 0) == 0;
+        struct sysinfo si;
+        const uint64_t total_ram = (sysinfo(&si) == 0) ? (uint64_t) si.totalram * si.mem_unit : 0;
+        if (!ram_overridden && total_ram > 0 && total_ram < (56ull << 30)) {
+            std::fprintf(stderr, "unbiased-strata: host RAM is %.1f GiB: with --peer-device the resident arena does "
+                                 "not fit, so the experts stay mapped from the file (--mmap-experts "
+                                 "--resident-experts); override after -- to choose otherwise\n",
+                         (double) total_ram / (1ull << 30));
+            eargs.push_back("--mmap-experts");
+            eargs.push_back("--resident-experts");
+        }
+    }
+    // Test hook (also used by the front-end peer tests): with STRATA_DUMP_EARGS=1 print the engine command line
+    // and exit before starting anything, so the flag forwarding is checkable without a model.
+    if (const char* dump = std::getenv("STRATA_DUMP_EARGS"); dump != nullptr && std::string(dump) == "1") {
+        for (const std::string& e : eargs) std::printf("%s\n", e.c_str());
+        return 0;
+    }
     std::signal(SIGPIPE, SIG_IGN);
     std::string err;
     if (!srv.engine.start(eargs, err)) { std::fprintf(stderr, "unbiased-strata: %s\n", err.c_str()); return 1; }

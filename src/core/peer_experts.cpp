@@ -1,6 +1,7 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
 
+#include "strata/core/vram_cap.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -80,7 +81,7 @@ void PeerExperts::close() {
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-                       std::string& err) {
+                       std::string& err, int64_t cap_mib, uint64_t blocker_b) {
     close();
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
@@ -131,9 +132,14 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
 
-    // the pairs the primary does not hold, in rank order, as many as fit
+    // the pairs the primary does not hold, in rank order, as many as fit.  Under --vram-cap the tier sizes itself
+    // as the smaller card would: the capped free figure (its own cap entry and blocker), not the raw one.
     size_t free_b = 0, total_b = 0;
     if (!ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
+    if (cap_mib > 0 && total_b > 0) {
+        const uint64_t all = total_b > free_b ? total_b - free_b : 0;
+        free_b = (size_t) vram_capped_free(free_b, all, (uint64_t) cap_mib, blocker_b);
+    }
     const uint64_t reserve = (uint64_t) std::max(reserve_mib, 128) << 20;
     const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
     std::vector<std::pair<int32_t, int32_t>> pick;

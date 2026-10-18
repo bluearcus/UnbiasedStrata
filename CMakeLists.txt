@@ -279,6 +279,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(dual_gpu_plan_check tools/dual_gpu_plan_check.cpp)
   target_link_libraries(dual_gpu_plan_check PRIVATE strata_plan)
   add_test(NAME dual_gpu_plan_check COMMAND dual_gpu_plan_check)
+
+  # PLAN-dual-gpu.md Phase 3: the per-device --vram-cap parsing and clamp arithmetic, GPU-free
+  add_executable(vram_cap_test tests/core/vram_cap_test.cpp)
+  target_link_libraries(vram_cap_test PRIVATE strata_plan)
+  add_test(NAME vram_cap_test COMMAND vram_cap_test)
 endif()
 
 # ---- strata_core (GPU runtime) ---------------------------------------------

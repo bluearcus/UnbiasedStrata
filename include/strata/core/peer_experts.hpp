@@ -40,10 +40,11 @@ public:
     PeerExperts& operator=(const PeerExperts&) = delete;
 
     /// Opens the tier on `device`: fills it with the first pairs of `ranked` that `primary` does not hold, as many
-    /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).
+    /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).  `cap_mib` (> 0) and
+    /// `blocker_b` are that card's --vram-cap entry and blocker: the tier sizes itself as the smaller card would.
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-              std::string& err);
+              std::string& err, int64_t cap_mib = 0, uint64_t blocker_b = 0);
     void close();
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
