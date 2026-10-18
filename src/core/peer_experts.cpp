@@ -1,6 +1,7 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
 
+#include "strata/core/peer_promotion.hpp"
 #include "strata/core/vram_cap.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -95,6 +96,9 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     n_expert_ = n_expert;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    last_forced_.assign((size_t) (n_layers * n_expert), kNotResident);   // never nominated
+    adapt_round_ = 0;
+    nominated_ = 0;
     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
         int a = 0, b = 0;
         cudaDeviceCanAccessPeer(&a, 0, device);
@@ -269,6 +273,24 @@ bool PeerExperts::finish(float* out, std::string& err) {
     for (size_t r = 0; r < row_of_.size(); ++r)
         std::memcpy(out + (size_t) row_of_[r] * H, h_out_ + r * H, (size_t) H * sizeof(float));
     launched_rows_ = 0;
+    return true;
+}
+
+bool PeerExperts::nominate_for_primary(const float* usage, const int32_t* res0, int max_n, int& nominated) {
+    nominated = 0;
+    if (!valid() || max_n <= 0) return true;
+    ++adapt_round_;
+    std::vector<Promotion> promos;
+    select_promotions(usage, res0, res_.data(), n_layers_, n_expert_, last_forced_.data(), adapt_round_,
+                       kPromoCooldown, max_n, promos);
+    for (const Promotion& p : promos) {
+        const size_t i = (size_t) p.layer * n_expert_ + p.expert;
+        if (res_[i] < 0) continue;   // raced by a concurrent backfill; tables are host-side, be careful anyway
+        res_[i] = kNotResident;     // evicted now: the CPU computes it meanwhile, the primary may take it up
+        last_forced_[i] = adapt_round_;
+        ++nominated;
+    }
+    nominated_ += nominated;
     return true;
 }
 

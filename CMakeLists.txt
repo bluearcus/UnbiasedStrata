@@ -284,6 +284,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(vram_cap_test tests/core/vram_cap_test.cpp)
   target_link_libraries(vram_cap_test PRIVATE strata_plan)
   add_test(NAME vram_cap_test COMMAND vram_cap_test)
+
+  # the peer-to-primary promotion rule (top-third heat evicted toward the fast card), GPU-free
+  add_executable(peer_promotion_test tests/core/peer_promotion_test.cpp)
+  target_link_libraries(peer_promotion_test PRIVATE strata_plan)
+  add_test(NAME peer_promotion_test COMMAND peer_promotion_test)
 endif()
 
 # ---- strata_core (GPU runtime) ---------------------------------------------

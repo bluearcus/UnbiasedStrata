@@ -5892,6 +5892,10 @@ int main(int argc, char** argv) {
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            if (peer.valid()) {   // upward tier move first: peer experts hot enough for the fast card are evicted
+                int nev = 0;      // here, so the primary's selection below sees them as ordinary candidates
+                if (!peer.nominate_for_primary(drive.d.usage.data(), host_res.data(), o.adapt_swaps, nev)) return false;
+            }
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -6197,16 +6201,18 @@ int main(int argc, char** argv) {
             const int64_t mapped = std::max<int64_t>(total - vram_held - ram_copies, 0);
             const int64_t peer_slots = peer.slots(), peer_held = peer.resident(), peer_hits = peer.entries();
             const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-            char buf[960];
+            char buf[1024];
             std::snprintf(buf, sizeof buf,
                           "STATS {\"experts\":%lld,\"vram_slots\":%lld,\"vram_held\":%lld,\"peer_slots\":%lld,"
                           "\"peer_held\":%lld,\"peer_hits\":%lld,\"peer_ms_wait\":%.1f,\"peer_p2p\":%s,"
+                          "\"peer_nominated\":%lld,"
                           "\"ram_copies\":%lld,\"mapped\":%lld,"
                           "\"mean_blob\":%llu,\"tokens\":%lld,\"vram_hits\":%lld,\"lookups\":%lld,\"ram_reads\":%lld,"
                           "\"file_reads\":%lld,\"file_mb\":%.1f,\"warm_hints\":%lld,\"major_faults\":%llu,\"max_context\":%lld}",
                           (long long) total, (long long) vram_slots, (long long) vram_held,
                           (long long) peer_slots, (long long) peer_held, (long long) peer_hits,
                           peer.ms_wait, peer.p2p() ? "true" : "false",
+                          (long long) peer.nominated(),
                           (long long) ram_copies,
                           (long long) mapped, (unsigned long long) (lay.native && total > 0 ? lay.total / (uint64_t) total : lay.max_blob),
                           (long long) served_tokens, (long long) drive.d.cache_hits,
