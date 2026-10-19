@@ -116,6 +116,38 @@ justified on this hardware. It becomes worth revisiting only if the pool stops b
 a CPU with AVX-512 VBMI (Ice Lake / Zen 4+), or a quantization small enough that the experts fit in VRAM
 (Q2_0 / IQ2_XS at ~34 GB is still larger than 34 GB of VRAM minus KV, so not today).
 
+### `--batch-mtp` does not exist in this fork
+
+The engine here is 0.1.39; per-slot drafters arrived upstream at 0.1.43+, and `grep -rn "BATCH_MTP|batch_mtp"
+src/ include/` finds nothing. That matters more than it looks: speculation is what amortises GPU work per
+window, and one stream already gets it.
+
+| Config | Tokens per window | Window | Aggregate |
+| --- | --- | --- | --- |
+| single stream + MTP (`--spec 4`, ~70% acceptance) | ~1.9 | ~22 ms | ~85 tok/s |
+| `--batch 2`, no per-slot drafting | 2.0 (1 per slot) | ~23.6 ms | ~85 tok/s |
+
+Without per-slot drafters, batching *replaces* the strong amortisation (speculation) with a weak one (expert
+sharing, near zero between unrelated conversations): same aggregate, half the speed per user.
+
+### Throughput conclusions for the current architecture on this rig - nothing to do
+
+| Path | Aggregate | Work | Confidence |
+| --- | --- | --- | --- |
+| today: single stream, peer on, 262K | **~85 tok/s** | - | measured |
+| + VNNI-without-VBMI CPU kernel only | ~85 (no change) | 1-2 weeks | high (pool has 47% slack) |
+| + `--batch 2` only | ~85 aggregate, ~42 per user | 1-2 weeks front end | measured |
+| + backport per-slot drafting (`--batch-mtp`) | ~110-150? | weeks of engine work (per-slot drafters sharing weights, per-slot K/V rings, window geometry) | **low** - unmeasured here |
+| ... plus a faster pool to feed it | higher again | + 1-2 weeks | medium |
+
+Reaching 100+ tok/s therefore needs per-slot speculation backported from a newer upstream **and** the VNNI
+kernel (3.8 tokens per window roughly doubles today's pool work). That is a months-scale project with a
+low-confidence payoff on this GPU/CPU pair, not the front-end-only work the batching plan scoped.
+
+**Verdict: stop optimising throughput on this rig.** ~85 tok/s single-stream is the architecture's limit here;
+the peer tier remains valuable as headroom (CPU independence), not as speed. Revisit only with a VBMI-capable
+CPU, a smaller quantization, or a batched-and-speculating engine.
+
 ## Is the CPU pool on the critical path? (it depends on the regime)
 
 `tools/dual_gpu_pool_critical_path.sh` starves the pool of workers and measures the throughput response
