@@ -115,3 +115,30 @@ on top would leave it below the single-stream rate per user.
 justified on this hardware. It becomes worth revisiting only if the pool stops being the bottleneck:
 a CPU with AVX-512 VBMI (Ice Lake / Zen 4+), or a quantization small enough that the experts fit in VRAM
 (Q2_0 / IQ2_XS at ~34 GB is still larger than 34 GB of VRAM minus KV, so not today).
+
+## Is the CPU pool on the critical path? (it depends on the regime)
+
+`tools/dual_gpu_pool_critical_path.sh` starves the pool of workers and measures the throughput response
+(single-stream serve, 262K, peer on, temp 0.7):
+
+| Workers | Throughput |
+| --- | --- |
+| 9 (default) | 81.2 tok/s avg |
+| 4 (44%) | 68.3 tok/s avg |
+
+A 56% cut costs only 16%, so with `T = max(GPU, pool)` the fit is **pool ~6.6 ms/token against GPU ~12.3 ms**:
+the pool runs ~47% ahead of the GPU and has slack. **A faster CPU kernel would therefore gain nothing for
+single-stream serving** on this rig, even though the AVX-2 fallback is genuinely 2-3x slower than the
+VBMI path it replaces.
+
+The two regimes where the pool *is* the limit, and where a faster kernel would pay:
+
+| Regime | Pool/token | GPU/token | Limiter |
+| --- | --- | --- | --- |
+| single stream, serve, real prompt (~70% acceptance) | ~6.6 ms | ~12.3 ms | GPU |
+| single stream, generate mode, degenerate prompt (30% acceptance: more rounds/token) | ~8.1 ms (15.0 ms/round) | ~11.5 ms | pool per round |
+| `--batch 2` (two unrelated conversations share almost no experts) | ~13.2 ms | ~12.3 ms | **pool** |
+
+So the kernel work and the batching work are complements, not alternatives: alone, each is worth ~nothing on
+this hardware (single stream is GPU-bound; batching without a faster pool just halves each stream). Together
+they would make two streams GPU-bound again, i.e. roughly 2x the aggregate of one stream.
