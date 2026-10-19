@@ -88,3 +88,30 @@ are copied to RAM by profile rank. Explicit `--mmap-experts` / `--resident-*` / 
 ~half the 3090's bandwidth — slower decode for pooled KV, a different product decision) and `--remote-expert*`
 stay refused at the front end. Qwen3.6-35B-A3B (2048-wide) is refused by the engine's width guard under a peer;
 its multi-GPU path is the split, not this tier.
+
+## Batching: measured, and on hold
+
+`tools/dual_gpu_batch_probe.sh` drives the engine's own serve protocol (`BGEN`/`BT`/`BDONE`) with
+`--batch 2 --peer-device 1` and two 200-token conversations, no front end involved. Measured on this rig
+(262K, q4_0, peer on, real prose prompts):
+
+| Arm | Per stream | Aggregate |
+| --- | --- | --- |
+| One request (baseline) | 89.8 tok/s | 89.8 tok/s |
+| `--batch 2` | 42.5 / 44.4 tok/s | **84.9 tok/s** |
+| `--batch 2` (+`STRATA_BATCH_MTP=1`) | 43.1 / 45.2 tok/s | **86.2 tok/s** |
+
+The engine half works exactly as documented (`--batch: 2 slot sessions on CUDA0 (2.25 GiB each)`, interleaved
+`BT` lines, per-slot `BDONE`), but **batching buys nothing here**: aggregate throughput is unchanged while
+each stream halves. The mechanism: batching amortises *shared GPU work* (dense weights, head, shared expert,
+and any expert two streams both routed). On this rig the binding resource is the **CPU expert pool**, which is
+AVX-2 limited (the 10900X has AVX-512 VNNI but not VBMI, so the fast kernels are unavailable), and two
+unrelated conversations share almost no experts - so the pool's work doubles and aggregate stays flat.
+
+`STRATA_BATCH_MTP` did not engage in this configuration (no per-slot drafter line); even a best case of +15%
+on top would leave it below the single-stream rate per user.
+
+**Consequence:** the ~12-17 day front-end batching project (`PLAN-batching.md`, held unversioned) is not
+justified on this hardware. It becomes worth revisiting only if the pool stops being the bottleneck:
+a CPU with AVX-512 VBMI (Ice Lake / Zen 4+), or a quantization small enough that the experts fit in VRAM
+(Q2_0 / IQ2_XS at ~34 GB is still larger than 34 GB of VRAM minus KV, so not today).
