@@ -326,3 +326,44 @@ What the shift reveals:
 * **The promotion pass still does not pay**, even in the one scenario it was written for, at either rate: it
   deepens the dip (79.8 / 80.3 against 86.1) and lands lower at recovery (99.1 / 98.8 against 101.9). Its demotions
   compete with the adaptation the tier is already doing. Default stays off.
+
+## Where this stops, and why (the current expectation)
+
+**The configuration we ship and use:** 0.1.45 engine, peer tier on, promotion off, 262K context, `--kv q4_0`.
+Measured: **~98 tok/s** (IQ3_XXS) and **~89 tok/s** (IQ3_S) on a single stream, one request at a time.
+
+Everything left on the table is *conditional* work with a modest, uncertain ceiling, which is why it stops here.
+
+### Concurrency (pi sub-agents)
+
+pi ships without sub-agents ("skips features like sub-agents and plan mode" - its README); they would be an
+extension issuing concurrent completions. Against this rig that means **queueing, not parallelism**: the front end
+has one slot, and forcing two slots *loses* throughput today (-29% at 32K, -40% at 262K) because the CPU pool
+crosses the GPU path.
+
+The plausible end state is two concurrent streams at ~60-75 tok/s each (~1.5-1.8x aggregate) - never N-x, and only
+after two more projects. Getting there needs, in order:
+
+| Step | Cost | Gate | Gain |
+| --- | --- | --- | --- |
+| CPU kernel (VNNI without VBMI), if E1-E4 say compute-bound | 2-4 days | pool must be compute-bound, not DDR4-bound | 0-5% on one stream |
+| Port PolyStrata's slot scheduler (MIT, ~300-500 lines + ~1,660 lines of reference tests) | 1-2 weeks | only worth it with the faster pool | ~1.5-1.8x aggregate on 2 streams |
+| Build sub-agents in pi (an extension, out of this repo) | unknown | - | concurrency, if the workload wants it |
+
+### Why the gain is likely small in practice
+
+Agent turns are prompt-heavy and generation-light: tool results, file reads and restated context dominate the wall
+clock, and prefill is this rig's strong side (~2,160 tok/s at 32K in the upstream matrix). The decode figures above
+matter for long thinking and long outputs - exactly the part where two sub-agents would contend, and exactly the
+part that batching would improve by 1.5x rather than 2x.
+
+### What would restart it
+
+1. `docs/PLAN-CPU-KERNEL.md` E1-E4 pointing at **H1 (compute-bound)** rather than H2 (DDR4-bound) or H3
+   (schedule-bound) - a single working day to answer.
+2. A measured agent loop showing wall clock lost to *decode contention* rather than prompt or tool latency.
+3. Upstream reinstating `--batch` slot serving in `serve/` (their `PLAN.md` defers it rather than rejects it), which
+   would remove the porting work entirely.
+
+Absent one of those, the honest summary is: **~98 tok/s single stream is where this rig lands, and the remaining
+ideas are weeks of work for a conditional 1.5x on a minority of an agent's wall clock.**
