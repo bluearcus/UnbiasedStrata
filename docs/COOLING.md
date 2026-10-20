@@ -24,6 +24,8 @@ the prose further down is background.
 | O1 | ~~Confirm the 3090's own fan channel reads Unmanaged~~ — **done, confirmed Unmanaged**, so LACT owns the card and CoolerControl does not | you | closed |
 | O2 | Sustained soak, 12 min — **done, results below** | assistant | closed |
 | O3 | Steepen the intake curve / the card's own fan curve to buy a few more degrees | you decide | see "Soak result" below |
+| O7 | **Calibrate `fan1`** (AIO radiator push pair) — the one intake header CoolerControl has no calibration for, so its stall duty is unknown | you, GUI (~2 min, engine idle) | nothing |
+| O8 | Put `fan1` on the `Case Fans (CPU or VRAM)` mix once O7 exists, then re-soak and check the intake/exhaust balance | assistant | O7 |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
 | O4 | Create one **CPU-sourced Graph profile** — **done**: `CPU temp profile`, source `Package id 0` on `coretemp` (verified it is not the NVMe `Composite` sensor, which also exposes `temp1`) | you, GUI | closed |
 | O5 | Mix Profiles on `fan3`/`fan4`/`fan6` — **done**: `Case Fans (CPU or VRAM)`, `Max`, members `CPU temp profile` + `Top Rear Exhaust (VRAM)` | assistant | closed |
@@ -318,6 +320,23 @@ the card's own fan sat at 30–33 %.
 
 Remaining headroom: `fan5` reached 1480 RPM against a calibrated maximum of 1769, and the card's own fan only reached
 ~50 % of its scale.  So there is more cooling available if we want it — that is a noise decision, not a safety one.
+
+### Known gap: the case is probably at negative pressure under GPU load
+
+Measured duties in the 12-minute soak: exhaust `pwm3` 61–83 %, `pwm4` 63–85 %, `pwm6` 67–85 %.  Intake was `pwm5` at
+50–74 % plus `pwm1` — **which the harness never sampled at all** (fixed in `446dc5c`: it now samples all six headers
+and prints an intake-versus-exhaust balance line).
+
+With the radiator pair at the 67–69 % seen during the CPU test, the duty-weighted balance works out near **0.88
+intake-to-exhaust, and the true airflow ratio is worse than that number** because a fan pushing through a radiator
+moves less air per percent than a free-air fan.  So the intuition that the case goes negative under GPU load is well
+supported.
+
+`fan1` was left on its BIOS curve for exactly one reason: CoolerControl has calibrations for `fan3`–`fan6` only
+(start duty 16 / 14 / 20 / 30 %, maxima 1313 / 1333 / 1769 / 1209 RPM), and putting an uncalibrated header under
+automatic control means not knowing where it stops spinning.  Calibration is a two-minute job in the GUI, so this is
+a gap to close rather than a reason to leave the intake alone.  `fan2` stays unmanaged: it is a pump (~4150 RPM
+regardless of duty), and pumps should not be modulated.
 
 
 
