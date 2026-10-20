@@ -116,3 +116,33 @@ Still open:
   no `--engine` self-exec). Every recipe in `docs/DUAL-GPU.md` and the benchmark/pull scripts still uses the
   0.1.39 form.
 * **Gates G1/G2/G4/G6 re-run** on the rebased engine with the peer (the numbers above are single-GPU).
+
+---
+
+## 8. Marker sweep and gates on the rebased tree
+
+**Marker sweep:** every edit inside an upstream file now sits in a `STRATA-FORK-BEGIN` / `STRATA-FORK-END` block:
+`generate.cpp` (3), `peer_experts.cpp` (3), `peer_experts.hpp` (2), `strata_context.cpp` (2). A rebase is
+`grep -rn STRATA-FORK src include frontend` plus the eleven hunks it prints.
+
+**G1 (start with the peer):** passes through `tools/strata-dual` - peer line, `p2p no`, and `/health` reporting
+`vram_slots 10536`, `peer_slots 5297` at the 2500 MiB reserve.
+
+**G2 (logit parity): blocked on another upstream change.** 0.1.45 removed `--teacher-force` and `--spec-oracle`,
+and `--dump-logits` prints "logits dumped" but writes **zero rows** in this configuration (0-byte files, both
+configs). G2 needs either the dump fixed or a different instrument; it is the one gate still open.
+
+**G6 (throughput), same pack/prompts/settings, 3-run medians, rebased engine:**
+
+| Cell | Single | Peer | Delta |
+| --- | --- | --- | --- |
+| 1K | **114.2** | 102.2 | -10.5% |
+| 4K | 91.5 | **97.6** | +6.7% |
+| 32K | **87.9** | 81.3 | -7.5% |
+
+The peer is **throughput-neutral on average** and noisy in both directions - the same conclusion as on 0.1.39
+(`docs/DUAL-GPU.md`), reached on a 6-20% faster engine. It remains valuable as *headroom* (it removes the CPU
+tier from the critical path) and for larger quantizations, where IQ3_S measured +7%.
+
+**Not re-run:** G4 (resident RAM x peer) - the resident-arena path was a net loss on this host on 0.1.39 and the
+shim no longer defaults it (only below ~56 GiB), so there is nothing new to prove until a small host is tested.

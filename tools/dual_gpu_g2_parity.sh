@@ -50,8 +50,11 @@ ROOT=$(cd "$HERE/.." && pwd)
 BIN=${STRATA_BIN:-$ROOT/build/unbiased-strata}
 [ -x "$BIN" ] || { echo "no engine at $BIN (set STRATA_BIN)" >&2; exit 2; }
 TMP=$(mktemp -d /tmp/g2-parity.XXXXXX)
-COMMON=(--engine --pack "$PACK" --native "$MODEL" --expert-profile "$PACK/expert-profile.bin"
-        --expert-cache auto --mtp "$MTP" --max-context 4096 --kv q4_0 --ple-io direct
+ENGINE_FLAG=${ENGINE_FLAG---engine}   # 0.1.39 self-execs its engine; 0.1.45 is a separate binary (set ENGINE_FLAG=)
+BASE_ARGS=()
+[ -n "$ENGINE_FLAG" ] && BASE_ARGS+=("$ENGINE_FLAG")
+COMMON=("${BASE_ARGS[@]}" --pack "$PACK" --native "$MODEL" --expert-profile "$PACK/expert-profile.bin"
+        --expert-cache auto --mtp "$MTP" --max-context 4096 --kv q4_0 --ple-io direct --kv int8
         --spec 4 --prefill 512
         --tokens "$TOKENS" --max-new "$MAXNEW" --adapt-every 100000)
 # Flash-Next ships a second shard holding the PLE table: the engine reads it as --ple-gguf

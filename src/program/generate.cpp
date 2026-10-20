@@ -6372,12 +6372,13 @@ int main(int argc, char** argv) {
                              "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
-        // STRATA-FORK: the probe's verdict - decode needs no P2P (rows return through pinned host rows), the
-        // prompt-side helper does
+        // STRATA-FORK-BEGIN: the P2P probe's verdict - decode needs no P2P (rows return through pinned host
+        // rows), the prompt-side helper does
         std::fprintf(stderr, "strata generate: peer GPU %d: p2p %s between the cards - %s\n", o.peer_device,
                      peer.p2p() ? "yes" : "no",
                      peer.p2p() ? "the peer also computes its experts' prompt rows (--peer-prefill-rows bounds them)"
                                 : "the prompt path stays on the primary GPU (decode still gains the peer's tier)");
+        // STRATA-FORK-END
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
@@ -9703,10 +9704,13 @@ int main(int argc, char** argv) {
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
-            if (peer.valid()) {   // STRATA-FORK: upward tier move first (peer_promotion.hpp), so the primary's
-                int nev = 0;      // selection below sees the nominations as ordinary candidates
+            // STRATA-FORK-BEGIN: upward tier move first (peer_promotion.hpp), so the primary's selection below
+            // sees the nominations as ordinary candidates
+            if (peer.valid()) {
+                int nev = 0;
                 if (!peer.nominate_for_primary(drive.d.usage.data(), host_res.data(), o.adapt_swaps, nev)) return false;
             }
+            // STRATA-FORK-END
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;

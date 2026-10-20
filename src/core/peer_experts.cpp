@@ -1,7 +1,9 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
 
+// STRATA-FORK-BEGIN: promotion pass
 #include "strata/core/peer_promotion.hpp"
+// STRATA-FORK-END
 
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -137,9 +139,11 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     n_expert_ = n_expert;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    // STRATA-FORK-BEGIN: promotion-pass state
     last_forced_.assign((size_t) (n_layers * n_expert), kNotResident);   // never nominated
     adapt_round_ = 0;
     nominated_ = 0;
+    // STRATA-FORK-END
     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
         int a = 0, b = 0;
         cudaDeviceCanAccessPeer(&a, primary_device(), device);
@@ -328,6 +332,7 @@ bool PeerExperts::finish(float* out, std::string& err) {
     return true;
 }
 
+// STRATA-FORK-BEGIN: the promotion pass
 bool PeerExperts::nominate_for_primary(const float* usage, const int32_t* res0, int max_n, int& nominated) {
     nominated = 0;
     if (!valid() || max_n <= 0) return true;
@@ -345,6 +350,8 @@ bool PeerExperts::nominate_for_primary(const float* usage, const int32_t* res0, 
     nominated_ += nominated;
     return true;
 }
+
+// STRATA-FORK-END
 
 bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err) {
     if (!pending_.empty() || max_swaps <= 0) return true;
