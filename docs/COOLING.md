@@ -24,8 +24,9 @@ the prose further down is background.
 | O1 | ~~Confirm the 3090's own fan channel reads Unmanaged~~ — **done, confirmed Unmanaged**, so LACT owns the card and CoolerControl does not | you | closed |
 | O2 | Sustained soak, 12 min — **done, results below** | assistant | closed |
 | O3 | Steepen the intake curve / the card's own fan curve to buy a few more degrees | you decide | see "Soak result" below |
-| O7 | **Calibrate `fan1`** (AIO radiator push pair) — the one intake header CoolerControl has no calibration for, so its stall duty is unknown | you, GUI (~2 min, engine idle) | nothing |
-| O8 | Put `fan1` on the `Case Fans (CPU or VRAM)` mix once O7 exists, then re-soak and check the intake/exhaust balance | assistant | O7 |
+| O7 | Calibrate `fan1` — **done**: starts spinning at **0% duty**, max **1771 RPM**, so it cannot be parked | you, GUI | closed |
+| O8 | Put `fan1` on the `Case Fans (CPU or VRAM)` mix, then re-soak and check the intake/exhaust balance | assistant patched it; you apply (root) | your `apply` |
+| O9 | **4070 as a backplate blower**: the 4070 sits half a slot above the 3090 and intakes from that gap, so ramping it drains the hot blanket sitting on the 3090's backplate — its hottest, least-cooled surface. Test with a decay A/B (4070 fan pinned high vs its VBIOS 30%) before committing to the noise | assistant | O8 measured |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
 | O4 | Create one **CPU-sourced Graph profile** — **done**: `CPU temp profile`, source `Package id 0` on `coretemp` (verified it is not the NVMe `Composite` sensor, which also exposes `temp1`) | you, GUI | closed |
 | O5 | Mix Profiles on `fan3`/`fan4`/`fan6` — **done**: `Case Fans (CPU or VRAM)`, `Max`, members `CPU temp profile` + `Top Rear Exhaust (VRAM)` | assistant | closed |

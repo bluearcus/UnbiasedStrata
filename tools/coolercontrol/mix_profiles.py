@@ -14,14 +14,17 @@ profile rather than hard-coding it: it looks for a Graph profile whose temperatu
 If it cannot find exactly one, it stops and tells you what it saw.
 
 WHAT IT CHANGES
+  fan1  AIO radiator intake pair -> Mix (CPU or VRAM exhaust curve)   was: BIOS CPU curve
   fan3  rear exhaust        -> Mix (CPU or VRAM exhaust curve)   was: BIOS CPU curve
   fan4  top forward exhaust -> Mix (CPU or VRAM exhaust curve)   was: BIOS CPU curve
   fan6  top rear exhaust    -> Mix (CPU or VRAM exhaust curve)   was: VRAM-only profile
 WHAT IT LEAVES ALONE
   fan5  GPU intake          stays VRAM-only: its job is the GDDR6X, and it is the only unobstructed intake
-  fan1  AIO radiator        stays on its BIOS curve until it is calibrated (it was never calibrated; stalling two
-                            AIO fans on an unknown duty floor is not a risk worth taking for a marginal gain)
-  fan2  AIO pump            never touched
+  fan2  AIO pump            never touched (~4150 RPM regardless of duty; pumps are not modulated)
+
+fan1 joins the mix once calibrated: calibrations.json says it starts spinning at 0% duty and reaches 1771 RPM, so it
+cannot be parked.  It also matters for pressure, not just radiator cooling - the radiator pair is one of only two
+intake headers in a case running three exhausts.
 
 SAFETY.  Same contract as vram_profiles.py: refuses to run while coolercontrold is active; byte-exact validated
 backup before any write; the patched text is re-parsed and every assignment is checked to resolve to the intended
@@ -57,10 +60,13 @@ MIX_UID = "9d3a5b14-2c8f-4a60-b7e1-6f0c9a2d4e03"
 MIX_NAME = "Case Fans (CPU or VRAM)"
 
 TARGETS = {
+    "fan1": "AIO radiator intake push pair",
     "fan3": "rear exhaust",
     "fan4": "top forward exhaust",
     "fan6": "top rear exhaust",
 }
+
+CALIBRATIONS = "/etc/coolercontrol/calibrations.json"
 
 HEADER_RE = re.compile(r"^\[\[?[A-Za-z0-9_.-]+\]\]?\s*$")
 DEV_HEADER = f"[device-settings.{MB_DEVICE}]"
@@ -105,6 +111,22 @@ def join_segments(segs):
     return "\n".join(out)
 
 
+def calibrated_start_duty(channel):
+    """Lowest duty at which the calibration saw the fan actually spinning, or None if uncalibrated."""
+    import json
+    try:
+        data = json.load(open(CALIBRATIONS, encoding="utf-8"))
+    except OSError:
+        return None
+    for e in data.get("calibrations", []):
+        if e.get("device_uid") != MB_DEVICE or e.get("channel_name") != channel:
+            continue
+        for pt in e.get("calibration", {}).get("up_curve", []):
+            if pt.get("rpm", 0) > 0:
+                return pt["duty"]
+    return None
+
+
 def find_cpu_profile(parsed, text):
     """The profile the GUI created: a Graph profile with a temperature source that is not the VRAM File sensor."""
     cands = []
@@ -132,12 +154,24 @@ def find_cpu_profile(parsed, text):
 
 
 def build_patch(text, parsed):
-    if MIX_UID in text:
-        sys.exit("already applied (the mix profile uid is present).  Use 'revert' to undo.")
-    cpu = find_cpu_profile(parsed, text)
-    log(f"CPU profile found: {cpu.get('name')!r} uid={cpu['uid']} temp_source={cpu['temp_source']}")
-    if VRAM_EXHAUST_UID not in {p.get("uid") for p in parsed.get("profiles", [])}:
-        sys.exit(f"the VRAM exhaust profile {VRAM_EXHAUST_UID} is missing - run vram_profiles.py first")
+    profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
+    existing_mix = profiles.get(MIX_UID)
+    if existing_mix:
+        # An earlier run already created the mix.  Reuse it instead of refusing, so adding a channel later is one
+        # command rather than revert-and-reapply.
+        if existing_mix.get("p_type") != "Mix" or existing_mix.get("mix_function_type") != "Max":
+            sys.exit(f"{MIX_UID} exists but is not a Max mix: {existing_mix}")
+        members = existing_mix.get("member_profile_uids") or []
+        if len(members) != 2 or VRAM_EXHAUST_UID not in members:
+            sys.exit(f"the existing mix members are not what this tool expects: {members}")
+        cpu_uid = next(m for m in members if m != VRAM_EXHAUST_UID)
+        log(f"reusing the existing mix profile {MIX_NAME!r}; members {members}")
+    else:
+        cpu = find_cpu_profile(parsed, text)
+        log(f"CPU profile found: {cpu.get('name')!r} uid={cpu['uid']} temp_source={cpu['temp_source']}")
+        if VRAM_EXHAUST_UID not in profiles:
+            sys.exit(f"the VRAM exhaust profile {VRAM_EXHAUST_UID} is missing - run vram_profiles.py first")
+        cpu_uid = cpu["uid"]
 
     segs = split_segments(text)
     idx = next((i for i, (h, _) in enumerate(segs) if h == DEV_HEADER), None)
@@ -148,36 +182,47 @@ def build_patch(text, parsed):
     keys = [i for i, l in enumerate(block) if re.match(r"^[A-Za-z0-9_]+ = ", l)]
     insert_at = (keys[-1] + 1) if keys else 0
     new_lines = []
+    changed = 0
     for ch, note in TARGETS.items():
-        existing = [i for i in keys if block[i].startswith(f"{ch} = ")]
         line = f'{ch} = {{ profile_uid = "{MIX_UID}" }}   # {note}'
+        existing = [i for i in keys if block[i].startswith(f"{ch} = ")]
         if existing:
-            log(f"replacing {ch}: {block[existing[0]].split('#')[0].strip()}")
+            current = block[existing[0]].split("#")[0].strip()
+            if current == f'{ch} = {{ profile_uid = "{MIX_UID}" }}':
+                log(f"{ch} ({note}): already on the mix, leaving it")
+                continue
+            log(f"replacing {ch}: {current}")
             block[existing[0]] = line
+            changed += 1
         else:
+            log(f"adding {ch}: {note}")
             new_lines.append((insert_at, line))
             insert_at += 1
+            changed += 1
     for offset, line in sorted(new_lines, reverse=True):
         block.insert(offset, line)
+    if not changed:
+        sys.exit("every target channel is already on the mix - nothing to do")
 
-    profile = f'''[[profiles]]
+    if not existing_mix:
+        profile = f'''[[profiles]]
 uid = "{MIX_UID}"
 name = "{MIX_NAME}"
 p_type = "Mix"
 # Each member computes its own curve from its own temperature source; the mix takes the higher duty.  A shared case
 # fan should never have to decide whether it is a CPU fan or a GPU fan.
-member_profile_uids = ["{cpu['uid']}", "{VRAM_EXHAUST_UID}"]
+member_profile_uids = ["{cpu_uid}", "{VRAM_EXHAUST_UID}"]
 mix_function_type = "Max"
 function_uid = "0"
 '''
-    # Put the mix profile with the other profiles: insert before the first [[profiles]] segment that follows a
-    # header, i.e. keep the profiles array contiguous.
-    prof_idx = [i for i, (h, _) in enumerate(segs) if h == "[[profiles]]"]
-    if not prof_idx:
-        sys.exit("no [[profiles]] array found")
-    last = prof_idx[-1]
-    segs.insert(last + 1, ["[[profiles]]", profile.split("\n")[1:]])
-    return join_segments(segs), cpu
+        # Put the mix profile with the other profiles: insert after the last [[profiles]] segment so the array stays
+        # contiguous.
+        prof_idx = [i for i, (h, _) in enumerate(segs) if h == "[[profiles]]"]
+        if not prof_idx:
+            sys.exit("no [[profiles]] array found")
+        segs.insert(prof_idx[-1] + 1, ["[[profiles]]", profile.split("\n")[1:]])
+
+    return join_segments(segs), cpu_uid
 
 
 def validate(text):
@@ -210,8 +255,24 @@ def validate(text):
         if dev.get(ch, {}).get("profile_uid") != MIX_UID:
             sys.exit(f"REFUSED: {ch} -> {dev.get(ch)!r}, expected the mix profile")
     log("validated: TOML parses, no duplicate keys, mix profile well formed, assignments resolve:")
+    # Guaranteed floor of a Max mix = the highest of the members' own minimum duties.  Every target must be able to
+    # spin at that duty, otherwise the mix could park a fan at idle.
+    def member_min(p):
+        curve = p.get("speed_profile")
+        if curve:
+            return min(d for _, d in curve)
+        fixed = p.get("speed_fixed")
+        return fixed if fixed is not None else 0
+    member_floor = max(member_min(profiles[m]) for m in members)
+    log(f"   mix floor (Max of member minimums): {member_floor}% duty")
     for ch, note in TARGETS.items():
-        log(f"   {ch} ({note}) -> {MIX_NAME}  [members: " +
+        start = calibrated_start_duty(ch)
+        floor_note = f"calibrated start {start}%"
+        if start is None:
+            floor_note = "NOT CALIBRATED - no known stall duty"
+        elif member_floor < start:
+            sys.exit(f"REFUSED: {ch} does not spin until {start}% but the mix floor is only {member_floor}%")
+        log(f"   {ch} ({note}) -> {MIX_NAME}  [{floor_note}; members: " +
             ", ".join(profiles[m].get('name', m) for m in members) + ", Max]")
     keep = {k: v for k, v in dev.items() if k not in TARGETS}
     for ch, v in keep.items():
