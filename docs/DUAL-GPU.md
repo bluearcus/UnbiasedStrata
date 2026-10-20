@@ -7,6 +7,28 @@ The 4070 is a second **adaptive expert tier**, not a second pipeline stage: the 
 the next slice lives on the 4070, the rest in RAM. Decode gains ~2.7x the GPU-resident experts (2,361 -> 9,137
 slots at int8 KV, 37% of all experts); context stays bounded by the 3090, as before.
 
+## The 0.1.45 CLI, and `strata-dual`
+
+Upstream 0.1.45 replaced the front end: it parses llama-server options, takes `-m/--model`, and passes everything
+after `--` to the engine, which is a **separate binary** (`--engine PATH`). The old form (`--model/--pack/--mtp`
+with a self-exec engine) is gone.
+
+`tools/strata-dual` is the fork's front-end policy, kept **outside** upstream's front end so a rebase costs
+nothing. It assembles the engine's standard command from `--pack`/`--mtp`/`-m` and, with `--peer-device N`,
+validates the ordinal, probes P2P before the load, and defaults the reserve (2500 MiB), `--peer-prefill-rows 0`
+without P2P, `--ple-io direct` for a two-shard model, and the low-RAM tier below ~56 GiB. Explicit flags win.
+
+```
+build-rk/peer_p2p_probe 1          # p2p no        (the standalone probe the wrapper calls)
+CUDA_DEVICE_ORDER=PCI_BUS_ID tools/strata-dual \
+  --engine build-rk/strata -m /models/...-00001-of-00002.gguf --port 8080 \
+  --pack /models/pack-iq3-xxs --mtp /models/mtp --peer-device 1 \
+  -- --max-context 262144 --kv int8
+```
+
+`--dry-run` prints the command instead of running it. `/health` carries the tier census (see below) when the
+server is idle.
+
 ## Launch
 
 ```

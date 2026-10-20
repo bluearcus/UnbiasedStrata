@@ -1,0 +1,126 @@
+#!/bin/bash
+# tools/strata-dual - the peer-tier front end policy, outside upstream's front end.
+#
+# WHY THIS EXISTS.  Upstream's front end (0.1.45) is llama-server's option parser plus "everything after -- goes to
+# the engine", so --peer-device and its knobs already work - but nothing checks them, and a bad ordinal or a
+# missing --peer-prefill-rows is discovered only after the model has loaded.  All of that policy used to live in
+# the fork's own front end; keeping it here means upstream's main.cpp stays untouched, so a rebase costs nothing.
+#
+# WHAT IT DOES, when --peer-device N is given:
+#   * validates N against the visible CUDA devices (nvidia-smi -L, or the probe's own count);
+#   * probes P2P between card 0 and card N BEFORE the load and prints the verdict;
+#   * defaults --peer-reserve-mib 2500 (the engine's 600 assumes a dedicated card);
+#   * defaults --peer-prefill-rows 0 when there is no P2P (the prompt path cannot use the peer);
+#   * defaults --ple-io direct for a two-shard model (upstream's own default; the fork used to hard-code ram,
+#     which mlocks a 28.8 GB table and does not fit a 64 GB host);
+#   * below ~56 GiB of RAM, adds --mmap-experts --resident-experts (the engine's automatic fallback is skipped
+#     when a peer is configured).
+# An explicit flag anywhere on the command line always wins.
+#
+# USAGE
+#   strata-dual --engine PATH -m MODEL.gguf --pack DIR --mtp DIR [--peer-device N] [front-end options] \
+#               [-- engine options]
+#   strata-dual --config ... --dry-run        print the command it would run, then exit 0
+#
+# Everything it does not know about is passed through unchanged, so it is a drop-in for unbiased-strata.
+set -u
+
+PROBE=${STRATA_P2P_PROBE:-}
+DRY=0
+MODEL=""; PACK=""; MTP=""; PEER=""; RESERVE=""; PREFILL=""
+FRONT=(); ENGINE=(); SEEN_DASHDASH=0
+
+need() { echo "strata-dual: $1" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pack) PACK=${2:-}; shift 2 || shift;;
+    --mtp) MTP=${2:-}; shift 2 || shift;;
+    --peer-device) PEER=${2:-}; shift 2 || shift;;
+    --peer-reserve-mib) RESERVE=${2:-}; shift 2 || shift;;
+    --peer-prefill-rows) PREFILL=${2:-}; shift 2 || shift;;
+    --dry-run) DRY=1; shift;;
+    -m|--model) MODEL=${2:-}; FRONT+=("$1" "${2:-}"); shift 2 || shift;;
+    --) shift; while [ $# -gt 0 ]; do ENGINE+=("$1"); shift; done; SEEN_DASHDASH=1;;
+    *) FRONT+=("$1"); shift;;
+  esac
+done
+
+has_flag() {  # has_flag <flag> in the user's engine arguments or in BASE
+  local f=$1 a
+  for a in ${ENGINE+"${ENGINE[@]}"} ${BASE+"${BASE[@]}"}; do [ "$a" = "$f" ] && return 0; done
+  return 1
+}
+
+[ -n "$MODEL" ] || need "-m MODEL.gguf is required"
+[ -n "$PACK" ] || need "--pack DIR is required"
+[ -n "$MTP" ] || need "--mtp DIR is required (the draft head; the engine's speculative path needs it)"
+
+# the engine's standard command, which the old front end used to assemble: a pack is native, its profile lives in
+# the pack, the cache is automatic, and a two-shard model ships its PLE table in shard 2
+BASE=(--pack "$PACK" --native "$MODEL" --expert-profile "$PACK/expert-profile.bin"
+      --expert-cache auto --mtp "$MTP" --spec 4 --spec-min-p 0.5 --prefill auto)
+case "$MODEL" in
+  *-00001-of-00002.gguf) BASE+=(--ple-gguf "${MODEL/00001-of-00002/00002-of-00002}");;
+esac
+
+if [ -n "$PEER" ]; then
+  case "$PEER" in ''|*[!0-9]*) need "--peer-device must be a CUDA ordinal (1 or higher; 0 is the primary)";; esac
+  if [ "$PEER" -lt 1 ]; then
+    need "--peer-device is the peer card's CUDA ordinal (1 or higher; 0 is the primary)"
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
+    if [ "${COUNT:-0}" -gt 0 ] && [ "$PEER" -ge "$COUNT" ]; then
+      need "--peer-device $PEER: only $COUNT CUDA device(s) visible (pin the ordinals with CUDA_DEVICE_ORDER=PCI_BUS_ID)"
+    fi
+  fi
+
+  # find the probe: $STRATA_P2P_PROBE, beside this script, or in a sibling build dir
+  if [ -z "$PROBE" ]; then
+    for c in "$(dirname "$0")/peer_p2p_probe" "$(dirname "$0")/../build/peer_p2p_probe" \
+             "$(dirname "$0")/../build-rk/peer_p2p_probe"; do
+      [ -x "$c" ] && { PROBE=$c; break; }
+    done
+  fi
+  P2P="unknown"
+  if [ -n "$PROBE" ] && [ -x "$PROBE" ]; then
+    OUT=$("$PROBE" "$PEER" 2>/dev/null) && P2P=${OUT#p2p }
+  fi
+
+  BASE+=("--peer-device" "$PEER")
+  if [ -z "$RESERVE" ]; then
+    BASE+=("--peer-reserve-mib" "2500")   # the 4070 drives a desktop; 2500 is the fork's documented default
+  else
+    BASE+=("--peer-reserve-mib" "$RESERVE")
+  fi
+  if [ -n "$PREFILL" ]; then
+    BASE+=("--peer-prefill-rows" "$PREFILL")
+  elif [ "$P2P" = "no" ]; then
+    BASE+=("--peer-prefill-rows" "0")     # no P2P: the prompt path cannot use the peer
+  fi
+
+  echo "strata-dual: peer GPU $PEER, p2p $P2P, reserve ${RESERVE:-2500} MiB$([ "$P2P" = no ] && echo ', prompt path on the primary')" >&2
+
+  # the PLE table: a two-shard model ships it in shard 2
+  case "$MODEL" in
+    *-00001-of-00002.gguf) has_flag --ple-io || BASE+=("--ple-io" "direct");;
+  esac
+
+  # small hosts: with a peer the engine's automatic arena-to-mmap fallback does not run
+  MEM_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+  if [ -n "${MEM_KB:-}" ] && [ "$MEM_KB" -lt $((56 * 1024 * 1024)) ]; then
+    if ! has_flag --mmap-experts && ! has_flag --resident-experts && ! has_flag --resident-budget-gib; then
+      echo "strata-dual: $(awk -v k="$MEM_KB" 'BEGIN{printf "%.1f", k/1048576}') GiB of RAM: adding --mmap-experts --resident-experts" >&2
+      BASE+=("--mmap-experts" "--resident-experts")
+    fi
+  fi
+fi
+
+CMD=("${STRATA_FRONTEND:-unbiased-strata}" "${FRONT[@]}" "--" "${BASE[@]}" ${ENGINE+"${ENGINE[@]}"})
+
+if [ "$DRY" = 1 ]; then
+  printf '%s\n' "${CMD[@]}"
+  exit 0
+fi
+exec "${CMD[@]}"
