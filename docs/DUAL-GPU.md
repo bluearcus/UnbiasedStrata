@@ -365,5 +365,10 @@ part that batching would improve by 1.5x rather than 2x.
 3. Upstream reinstating `--batch` slot serving in `serve/` (their `PLAN.md` defers it rather than rejects it), which
    would remove the porting work entirely.
 
+**Update after deployment** (`docs/SERVICE.md`): `--conversation-cache-mib 8192` makes *interleaved* conversations
+cheap - a 115k-token conversation costs 50.6 s cold and 0.48 s once parked - so alternating sub-agent turns no
+longer pay prompt re-reads. That softens the concurrency objection below (it does not change the batching one, which
+is about simultaneous slots).
+
 Absent one of those, the honest summary is: **~98 tok/s single stream is where this rig lands, and the remaining
 ideas are weeks of work for a conditional 1.5x on a minority of an agent's wall clock.**

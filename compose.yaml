@@ -31,6 +31,11 @@ services:
       STRATA_KV: ${STRATA_KV:-q4_0}
       STRATA_PEER_DEVICE: ${STRATA_PEER_DEVICE:-1}
       STRATA_API_KEY: ${STRATA_API_KEY:-}
+      # Conversation cache: park other conversations in RAM so switching between them does not re-read the
+      # whole prompt (measured: a 115k-token conversation costs 50 s cold, 0.48 s when parked).  The floor
+      # stops parking when the host gets tight.  The VRAM reserve is the engine's own advice for the 262K
+      # window (#2065); it costs ~80 expert slots and nothing measurable in decode.
+      STRATA_EXTRA_ENGINE_ARGS: ${STRATA_EXTRA_ENGINE_ARGS:---conversation-cache-mib 8192 --conversation-cache-min-free-mib 2048 --vram-reserve-mib 832}
     ports:
       - "127.0.0.1:${STRATA_PUBLISH_PORT:-8080}:8080"
     volumes:
