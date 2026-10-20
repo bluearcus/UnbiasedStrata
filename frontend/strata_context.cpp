@@ -1196,9 +1196,24 @@ void strata_context::init_routes(server_http_context & http) {
         }
         // llama.cpp's shape ("status") plus the fields upstream PolyStrata clients (tools/strata_bench.py,
         // its is_strata / wait_ready) look for: "service" and "loaded". The engine only serves once loaded.
-        res->ok({{"status", "ok"}, {"busy", I->slot.active()},
-                 {"service", "strata"}, {"loaded", true},
-                 {"model", I->model_name}, {"max_context", I->n_ctx}});
+        json body = {{"status", "ok"}, {"busy", I->slot.active()},
+                     {"service", "strata"}, {"loaded", true},
+                     {"model", I->model_name}, {"max_context", I->n_ctx}};
+        // STRATA-FORK-BEGIN: the expert-tier census (peer tier included).  The engine's TIERS command is only
+        // valid between requests, so it is asked only when idle; a busy server reports no "tiers" rather than a
+        // stale figure.  Upstream 0.1.40 removed the STATS protocol this replaces.
+        if (!I->slot.active()) {
+            std::string reply, err;
+            if (I->engine.command("TIERS", "TIERS ", reply, err, 2000)) {
+                try {
+                    body["tiers"] = json::parse(reply.substr(reply.find(' ') + 1));
+                } catch (const std::exception &) {
+                    // a malformed census must not fail /health
+                }
+            }
+        }
+        // STRATA-FORK-END
+        res->ok(body);
         return res;
     };
 
