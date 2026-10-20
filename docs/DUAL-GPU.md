@@ -263,3 +263,29 @@ lines. The promotion pass settles at or near the peer's slot count (`nominated` 
 
 For comparison, the same quant on the 0.1.39 branch measured 81.9 (XXS peer) and 73.5 (S peer): the rebase is worth
 ~6% here and more at short context, where it is ~114 tok/s.
+
+## Regime-shift test: the workload every earlier benchmark missed
+
+All the cells above warm and measure inside one expert space (technical English / code), so the adaptive tier has
+nothing to chase and promotions have nothing to win. `tools/dual_gpu_shift_test.sh` fixes that: three requests in
+code/systems English, then three in French lyrical prose and gothic-novel analysis - a different region of expert
+space - with the tier counters read after **every** request.
+
+XXS, 262K window, q4_0 KV, 300 output tokens per request, tok/s per request:
+
+| Arm | A1 | A2 | A3 | **B1** | B2 | B3 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| peer, promotion off | 92.2 | 89.7 | 94.7 | **86.1** | 94.9 | **101.9** |
+| peer, promotion max 8 / gain 2 | 89.6 | 93.1 | 89.5 | 79.8 | 84.8 | 99.1 |
+| peer, promotion max 2 / gain 3 | 84.4 | 91.2 | 91.0 | 80.3 | 90.9 | 98.8 |
+| single GPU (control) | 85.2 | 93.8 | 92.6 | 79.3 | 93.2 | 93.6 |
+
+What the shift reveals:
+
+* **Adaptation is real and visible**: every arm dips at B1 (-7% to -12%) and recovers over the next two requests.
+  Single-stream steady-state benchmarks could not see this.
+* **The peer earns its keep here**: after the shift it reaches 101.9 tok/s against single-GPU's 93.6 (+8.9%), and
+  its `peer_hits` keeps climbing through the new domain - the tier is absorbing misses the 3090 cannot hold.
+* **The promotion pass still does not pay**, even in the one scenario it was written for, at either rate: it
+  deepens the dip (79.8 / 80.3 against 86.1) and lands lower at recovery (99.1 / 98.8 against 101.9). Its demotions
+  compete with the adaptation the tier is already doing. Default stays off.
