@@ -84,7 +84,11 @@ temp_min = 0.0
 temp_max = 100.0
 '''
 
-ASSIGNMENTS = f'''fan5 = {{ profile_uid = "{GPU_INTAKE_UID}" }}   # front bottom GPU intake
+ASSIGNMENTS = f'''[device-settings.{MB_DEVICE}]
+# The sub-table is keyed by DEVICE uid; the keys inside it are channel names.  Writing these two lines straight
+# under [device-settings] would read as a device called "fan5" with a channel called "profile_uid" - valid TOML,
+# silently nothing.
+fan5 = {{ profile_uid = "{GPU_INTAKE_UID}" }}   # front bottom GPU intake
 fan6 = {{ profile_uid = "{TOP_REAR_UID}" }}     # top rear exhaust'''
 
 ANCHOR_PROFILES = "[[functions]]"
@@ -156,12 +160,20 @@ def build_patch(text, path):
         if anchor not in text:
             sys.exit(f"refusing to edit {path}: anchor {anchor!r} not found - the config is not the shape this script expects")
     out = text.replace(ANCHOR_PROFILES, PROFILES + "\n" + ANCHOR_PROFILES, 1)
-    out = out.replace(ANCHOR_SETTINGS, ANCHOR_SETTINGS + "\n" + ASSIGNMENTS, 1)
     if REMOVE_PROFILE_UID in out:
         if f'profile_uid = "{REMOVE_PROFILE_UID}"' in out:
             sys.exit(f"refusing: a channel still applies {REMOVE_PROFILE_NAME!r}; reset that channel first")
         out, removed = remove_profile(out, REMOVE_PROFILE_UID, REMOVE_PROFILE_NAME)
         log(f"removing the unused {REMOVE_PROFILE_NAME!r} profile ({len(removed)} lines)")
+    # The device sub-table has to land directly under [device-settings] and before the next top-level table.
+    # If [device-settings] already holds keys, inserting a table header here would absorb them into the new table.
+    lines = out.split("\n")
+    i = lines.index(ANCHOR_SETTINGS)
+    nxt = next((l for l in lines[i + 1:] if l.strip() and not l.lstrip().startswith("#")), "")
+    if not nxt.startswith("["):
+        sys.exit(f"refusing: [device-settings] already has content (next line: {nxt!r}); inserting the device table "
+                 f"here would pull those keys into it")
+    out = "\n".join(lines[:i + 1] + ASSIGNMENTS.split("\n") + lines[i + 1:])
     return out
 
 
@@ -171,7 +183,15 @@ def validate(text, path):
     except Exception as e:
         sys.exit(f"REFUSED: the result is not valid TOML ({e})")
     profiles = {p.get("uid"): p.get("name") for p in parsed.get("profiles", [])}
-    settings = {k: v for k, v in parsed.get("device-settings", {}).items() if isinstance(v, dict)}
+    # The shape CoolerControl writes (see the example in the config's own comment block) is
+    # [device-settings.<device uid>] with channel names as keys.
+    dev_settings = parsed.get("device-settings", {}).get(MB_DEVICE)
+    if not isinstance(dev_settings, dict):
+        sys.exit(f"REFUSED: no [device-settings.{MB_DEVICE}] table in the result")
+    flat = [k for k, v in parsed.get("device-settings", {}).items() if not isinstance(v, dict)]
+    if flat:
+        sys.exit(f"REFUSED: keys directly under [device-settings] (not device-keyed): {flat}")
+    settings = {k: v for k, v in dev_settings.items() if isinstance(v, dict)}
     missing = [u for u in (GPU_INTAKE_UID, TOP_REAR_UID) if u not in profiles]
     if missing:
         sys.exit(f"REFUSED: profiles not visible after patching: {missing}")
@@ -183,9 +203,9 @@ def validate(text, path):
         got = settings.get(ch, {}).get("profile_uid")
         if got != want:
             sys.exit(f"REFUSED: {ch} -> {got!r}, expected {want!r} (the assignment landed in the wrong table)")
-    log("validated: TOML parses, both profiles present, both channels resolve:")
+    log("validated: TOML parses, both profiles present, both channels resolve under the device table:")
     for ch, uid in (("fan5", GPU_INTAKE_UID), ("fan6", TOP_REAR_UID)):
-        log(f"   {ch} -> {profiles[uid]}")
+        log(f"   device-settings.{MB_DEVICE[:12]}…{ch} -> {profiles[uid]}")
     untouched = sorted(set(("fan1", "fan2", "fan3", "fan4")) - set(settings))
     if untouched:
         log(f"   left on their BIOS curves: {', '.join(untouched)}")
@@ -195,6 +215,18 @@ def validate(text, path):
 def backups(path):
     d = os.path.dirname(path) or "."
     return sorted(glob.glob(os.path.join(d, BACKUP_GLOB)))
+
+
+def daemon_backup():
+    """Also ask the daemon for its own rotated backup (coolercontrold backup).  Best-effort: the script's own
+    byte-exact copy is the one revert depends on."""
+    if shutil.which("coolercontrold") is None:
+        return
+    r = subprocess.run(["coolercontrold", "backup"], capture_output=True, text=True)
+    if r.returncode == 0:
+        log("coolercontrold backup: ok (see 'sudo coolercontrold list')")
+    else:
+        log(f"NOTE: coolercontrold backup did not run ({(r.stdout + r.stderr).strip().splitlines()[-1:] or ['no output']})")
 
 
 def make_backup(path):
@@ -266,6 +298,7 @@ def cmd_apply(a):
     validate(patched, a.config)
 
     bak = make_backup(a.config)          # never proceed without a validated backup
+    daemon_backup()
     try:
         with open(a.config, "w", encoding="utf-8") as f:
             f.write(patched)
