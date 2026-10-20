@@ -45,29 +45,45 @@ The curves themselves (from `pwmN_auto_pointN_*`):
   duty (57 % and 70 %) that only changes if something reaches **101 °C**.  That is the "not configured sensibly"
   smoking gun: two of the case fans are pinned and respond to nothing.
 
-Reading the evidence together: `fan2` at a constant 4150 is the **AIO pump** on `PUMP_FAN1`; `fan1` moves most
-with the CPU, so it is the **AIO radiator pair** on `CPU_FAN1`; headers 3-4 are two case headers following CPU
-heat; headers 5-6 are the two case fans that are pinned.  Which of 3-6 is the front intake pair, the GPU intake,
-the rear exhaust and the top exhaust is **not** discoverable from software - the board does not label them.
+Reading the evidence: `fan2` at a constant 4150 is the AIO pump; `fan1` moves most with the CPU, so it is the
+AIO radiator pair.  Which of 3-6 was which was not discoverable in software - the board does not label them - so it
+was settled by cycling each channel to a fixed duty in CoolerControl and watching which physical fan moved
+(2026-10-20).
 
-### Confirming it (ranked, easiest first)
+### The confirmed mapping
 
-1. **CoolerControl's channel pages** (the GUI answer, and it is being installed anyway): open *Cooling*, pick a
-   channel, set it to a **fixed duty** - 100 %, then 20 %, then back - and watch which physical fan changes while
-   its RPM readout moves in the same page.  Six channels, six answers, nothing unplugged.  Cross-check against
-   the table above: the channel whose RPM sits at ~4150 is the pump, the one that jumps with CPU load is the AIO
-   radiator, and the two that never move are the pinned pair.
-2. **BIOS → Hardware Monitor**: the fan table lists each header with its current RPM; compare with the tach values
-   above (`fan1..fan6`) to line up header numbers with `pwmN`.
-3. **Physically**, if the first two are ambiguous: unplug one fan, watch `sensors` for the tach that drops to 0,
-   plug it back.  One fan at a time.
+| header | tach | duty before any change | **physical fan** |
+| --- | --- | --- | --- |
+| `pwm1` | `fan1` | 125/255, CPU curve | **CPU AIO radiator fans** |
+| `pwm2` | `fan2` | 125/255, CPU curve | **AIO pump** (4153 RPM, constant) |
+| `pwm3` | `fan3` | 194/255 (76 %), CPU curve | **rear exhaust** |
+| `pwm4` | `fan4` | 196/255 (77 %), CPU curve | **top forward exhaust** |
+| `pwm5` | `fan5` | **147/255 (57 %), flat SYSTIN curve** | **front bottom GPU intake** |
+| `pwm6` | `fan6` | **178/255 (70 %), flat SYSTIN curve** | **top rear exhaust** |
 
-### What the mapping is for
+That is the diagnosis in one line: **the only fan blowing at the 3090's backplate is the one pinned at 57 % by a
+curve that does not move until something reaches 101 °C**, while the CPU-driven fans run at 76-77 % because the
+9-worker CPU pool is warm.  Airflow path: front-bottom intake -> rear + top exhausts.
 
-Once named: the **GPU intake, front intake pair, rear and top exhaust** are the channels CoolerControl should
-drive off the `3090 VRAM` sensor (headers 3-6 are the candidates; 5-6 are the pinned ones that most need a real
-curve).  `CPU_FAN1` (AIO radiator) and `PUMP_FAN1` (pump) stay on their CPU curves - the 9-worker CPU pool is
-their problem, and the pump should not be modulated at all.
+### What each channel should be driven by
+
+| header | drive it with | why |
+| --- | --- | --- |
+| `pwm5` GPU intake | **`3090 VRAM`** Graph Profile, the most aggressive curve on the machine | it is the fan that actually cools the GDDR6X; it is currently the least responsive one |
+| `pwm6` top rear exhaust | **Mix Profile, Maximum of (`3090 VRAM`, CPU temperature)** | top-rear is where the card's own exhaust goes; it must follow both heat sources |
+| `pwm3` rear exhaust | Mix of (`3090 VRAM`, CPU) - or leave on its CPU curve if noise is the priority | already at 76 % off CPU heat; it is doing real work today |
+| `pwm4` top forward exhaust | Mix of (`3090 VRAM`, CPU), gentler than 5/6 | helps, but it is the furthest from the card |
+| `pwm1` AIO radiator | leave on its CPU curve | the CPU pool genuinely needs it |
+| `pwm2` AIO pump | **leave alone / fixed full speed** | pumps should not be modulated |
+
+Balance note: this case has one intake header against three exhaust headers.  Raising the exhausts with the VRAM
+signal while the intake stays pinned would just create negative pressure and pull air in through every gap - so
+`pwm5` should lead, with the exhausts following it, not the other way round.
+
+Calibration (`Cooling -> channel -> Calibrate`) measures each fan's true min/max RPM so the curves are expressed in
+real airflow rather than raw duty.  It is slow - a sweep per fan - and only needs doing once; run it while the
+engine is idle so the sweep is clean, and expect the applied curves to land at different duties than the raw
+percentages above.
 
 ## The split
 
