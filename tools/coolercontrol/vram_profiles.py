@@ -6,7 +6,7 @@ result before installing it, and restores that copy automatically if anything do
 daemon refusing to start.  Reverting is a file copy, not a re-edit.
 
 COMMANDS
-  plan     read the config, print the patched result, validate it, write nothing
+  plan     print and validate the intended change; writes nothing unless you pass --out
   apply    backup -> validate -> write -> coolercontrold check -> (optionally start the daemon); roll back on any failure
   revert   restore the most recent backup this script made
   backups  list the backups this script made
@@ -277,16 +277,27 @@ def cmd_plan(a):
     text = read_config(a.config)
     patched = build_patch(text, a.config)
     validate(patched, a.config)
-    open("/tmp/config.toml.patched", "w", encoding="utf-8").write(patched)
-    log("\nno changes written; the patched text is at /tmp/config.toml.patched")
     before, after = text.splitlines(), patched.splitlines()
     gone = [l for l in before if l not in after]
     added = [l for l in after if l not in before]
-    log(f"line diff (approximate - identical lines in other profiles cancel out): {len(added)} added, {len(gone)} removed")
+    log("\nnothing written.  line diff (approximate - identical lines in other profiles cancel out): "
+        f"{len(added)} added, {len(gone)} removed")
     for line in gone:
         log("   -" + line)
     for line in added:
         log("   +" + line)
+    if a.show:
+        log("\n--- full patched text ---")
+        print(patched, end="")
+    if a.out:
+        # Deliberately no fixed /tmp path: plan runs under sudo, and a predictable filename in a world-writable
+        # directory either collides with a file owned by someone else or leaves a root-owned file behind.
+        try:
+            with open(a.out, "w", encoding="utf-8") as f:
+                f.write(patched)
+            log(f"\npatched text written to {a.out}")
+        except OSError as e:
+            sys.exit(f"could not write {a.out}: {e}   (the plan itself validated fine; point --out somewhere writable)")
 
 
 def cmd_apply(a):
@@ -355,6 +366,8 @@ def main():
     ap.add_argument("command", choices=["plan", "apply", "revert", "backups"])
     ap.add_argument("--config", default=CONFIG)
     ap.add_argument("--start", action="store_true", help="with apply: start the daemon afterwards and roll back if it fails")
+    ap.add_argument("--out", help="with plan: also write the patched text to this path")
+    ap.add_argument("--show", action="store_true", help="with plan: print the whole patched file")
     a = ap.parse_args()
     return {"plan": cmd_plan, "apply": cmd_apply, "revert": cmd_revert, "backups": cmd_backups}[a.command](a)
 
