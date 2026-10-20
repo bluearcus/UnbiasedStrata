@@ -65,20 +65,34 @@ That is the diagnosis in one line: **the only fan blowing at the 3090's backplat
 curve that does not move until something reaches 101 °C**, while the CPU-driven fans run at 76-77 % because the
 9-worker CPU pool is warm.  Airflow path: front-bottom intake -> rear + top exhausts.
 
+### The airflow layout
+
+Front: **two fans push through the AIO radiator** (`pwm1`, restricted - they move air through fin stacks) and
+**one unobstructed fan at the front bottom** (`pwm5`, feeding the 3090 directly).  Exhaust: rear (`pwm3`), top
+forward (`pwm4`), top rear (`pwm6`).  So nominal intake is three fans, but two of them are fighting a radiator,
+which means the *effective* intake is much closer to the exhaust count than the fan count suggests - and the one
+free-flowing intake fan is the one aimed at the GPU.
+
 ### What each channel should be driven by
 
 | header | drive it with | why |
 | --- | --- | --- |
-| `pwm5` GPU intake | **`3090 VRAM`** Graph Profile, the most aggressive curve on the machine | it is the fan that actually cools the GDDR6X; it is currently the least responsive one |
-| `pwm6` top rear exhaust | **Mix Profile, Maximum of (`3090 VRAM`, CPU temperature)** | top-rear is where the card's own exhaust goes; it must follow both heat sources |
-| `pwm3` rear exhaust | Mix of (`3090 VRAM`, CPU) - or leave on its CPU curve if noise is the priority | already at 76 % off CPU heat; it is doing real work today |
-| `pwm4` top forward exhaust | Mix of (`3090 VRAM`, CPU), gentler than 5/6 | helps, but it is the furthest from the card |
-| `pwm1` AIO radiator | leave on its CPU curve | the CPU pool genuinely needs it |
+| `pwm5` front bottom GPU intake | **`3090 VRAM`** Graph Profile, the most aggressive curve on the machine | the only unobstructed intake, and the only fan blowing straight at the GDDR6X; currently the least responsive one |
+| `pwm1` AIO radiator pair | **Mix Profile, Maximum of (CPU curve, `3090 VRAM` curve)** | it is the bulk of the intake, and a hot case raises the coolant temperature the radiator has to reject - a CPU-only curve ignores the 300 W the GPU is putting into the same air |
+| `pwm6` top rear exhaust | **Mix Profile, Maximum of (`3090 VRAM`, CPU)** | top-rear is where the card's own exhaust goes; it must follow both heat sources |
+| `pwm3` rear exhaust | Mix Profile, Maximum of (`3090 VRAM`, CPU) | already doing real work at 76 % off CPU heat alone |
+| `pwm4` top forward exhaust | Mix Profile, Maximum of (`3090 VRAM`, CPU), gentler curve than 3/6 | helps, furthest from the card |
 | `pwm2` AIO pump | **leave alone / fixed full speed** | pumps should not be modulated |
 
-Balance note: this case has one intake header against three exhaust headers.  Raising the exhausts with the VRAM
-signal while the intake stays pinned would just create negative pressure and pull air in through every gap - so
-`pwm5` should lead, with the exhausts following it, not the other way round.
+Build it as **Mix Profiles, not Mix Custom Sensors**: make a Graph Profile per temperature source (one on
+`3090 VRAM`, one on the CPU sensor), then a Mix Profile that takes the **Maximum** of the two and apply *that* to
+the channel.  CoolerControl's own guidance is that a Mix Profile is the right tool "when mixing two temperature
+sensors with different ranges and response dynamics" - which is exactly the case here, since CPU load ramps slowly
+and generation load ramps fast.  A Mix *sensor* would collapse the two signals before the curve is applied.
+
+Balance: with two of three intakes restricted by the radiator, driving the exhausts harder than the intake would
+put the case under negative pressure and pull air in through every gap - worse cooling and noisier.  `pwm5` leads
+the ramp, the exhausts follow it, and `pwm1` is the way to add intake airflow without buying a fan.
 
 Calibration (`Cooling -> channel -> Calibrate`) measures each fan's true min/max RPM so the curves are expressed in
 real airflow rather than raw duty.  It is slow - a sweep per fan - and only needs doing once; run it while the
