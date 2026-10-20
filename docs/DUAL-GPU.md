@@ -100,10 +100,22 @@ VRAM; one H2D copy each way, blocking (~1-2 MB) between windows. Re-measured wit
 | max 8 / gain 2, exchange | 96.9 | 88.1 | 81.2 | 90.7 |
 | single GPU (control) | - | 91.4 | 75.2 | 97.4 |
 
-So a *tight* rate with the exchange is inside noise on steady state (+2%), **halves the transition dip** (88.0
-against 84.1, and against the control's 75.2), and a loose rate is still clearly bad. The dip improvement is one
-request of one arm, i.e. a signal that needs repetitions rather than a proven win - which is why the default stays
-off. `nominated` counts exchanged pairs (it read 0 for a while because the exchange stopped calling `evict()`).
+**The full trial (3 cold repeats per arm, `tools/dual_gpu_promotion_trial.sh`) settles it: no measurable gain.**
+
+| Metric (mean of 3 cold repeats) | off | max 2 / gain 3 + exchange | delta |
+| --- | ---: | ---: | ---: |
+| A mean (warm domain) | 90.5 | 92.5 | +2.1% |
+| **B1 (first request after the jump)** | **83.4** | **83.7** | **+0.4%** |
+| B mean (new domain) | 92.1 | 93.0 | +1.0% |
+
+Per-repeat B1 values overlap completely: off 81.9 / 84.1 / 84.1, promotion 86.1 / 83.3 / 81.7. The single-run
+"dip halves" reading (88.0 against 84.1) did not survive repetition - it was one sample of a distribution with a
++/-4 tok/s spread. Both arms dip by the same ~8% at B1 and recover by B3.
+
+**Final verdict on the promotion pass:** the exchange fixed the *harm* (it is no longer monotone-negative), but
+there is nothing to win on this rig - the bandwidth gap between the 3090 and 4070 is real, yet the number of rows
+that would benefit is small and the copies cost about what they save. Default **off**; the code, the knobs and the
+trial script stay for a peer with a much larger bandwidth ratio, where the same arithmetic points the other way.
 
 **The rate is the dominant variable.** The pass runs every `--adapt-every` windows (default 4) and was allowed up
 to `--adapt-swaps` (96) promotions per pass; the soak logs show it averaging ~18 per pass. Sweeping the budget at
