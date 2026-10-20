@@ -1,0 +1,23 @@
+# Sensor exporter for CoolerControl's File custom sensor.  It controls nothing; it only publishes the
+# 3090's hottest GDDR6X number as millidegrees.  Install:
+#   sudo cp tools/vram_sensor.py /usr/local/bin/vram-sensor && sudo chmod 0755 /usr/local/bin/vram-sensor
+#   sudo cp tools/vram-sensor.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now vram-sensor.service
+# then in the CoolerControl UI create a Temperature / File custom sensor on /run/vramsensor/vram.temp1.
+[Unit]
+Description=Publish the RTX 3090 GDDR6X temperature for CoolerControl
+After=lactd.service
+Wants=lactd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vram-sensor --file /run/vramsensor/vram.temp1 --interval 5
+RuntimeDirectory=vramsensor
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
