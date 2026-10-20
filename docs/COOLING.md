@@ -25,7 +25,7 @@ the prose further down is background.
 | O2 | Sustained soak, 12 min — **done, results below** | assistant | closed |
 | O3 | Steepen the intake curve / the card's own fan curve to buy a few more degrees | you decide | see "Soak result" below |
 | O7 | Calibrate `fan1` — **done**: starts spinning at **0% duty**, max **1771 RPM**, so it cannot be parked | you, GUI | closed |
-| O8 | Put `fan1` on the `Case Fans (CPU or VRAM)` mix, then re-soak and check the intake/exhaust balance | assistant patched it; you apply (root) | your `apply` |
+| O8 | `fan1` under automatic control — **done**, but on its own profiles, not the shared mix (see "Radiator pair and exhaust balance"). Mean exhaust speed fell 15-21% for a mean VRAM change of **-0.5 C** | assistant | closed |
 | O9 | **4070 as a backplate blower**: the 4070 sits half a slot above the 3090 and intakes from that gap, so ramping it drains the hot blanket sitting on the 3090's backplate — its hottest, least-cooled surface. Test with a decay A/B (4070 fan pinned high vs its VBIOS 30%) before committing to the noise | assistant | O8 measured |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
 | O4 | Create one **CPU-sourced Graph profile** — **done**: `CPU temp profile`, source `Package id 0` on `coretemp` (verified it is not the NVMe `Composite` sensor, which also exposes `temp1`) | you, GUI | closed |
@@ -340,6 +340,36 @@ a gap to close rather than a reason to leave the intake alone.  `fan2` stays unm
 regardless of duty), and pumps should not be modulated.
 
 
+
+### Radiator pair and exhaust balance — the second comparison soak
+
+Putting `fan1` on the shared `Case Fans (CPU or VRAM)` mix made the machine louder, for two reasons documented in
+`tools/coolercontrol/radiator_profiles.py`: `fan1`'s calibration starts at 641 RPM so profile duties are rescaled
+against its RPM range (58% duty there means 1298 RPM, 72% raw), and the VRAM member won the `Max` at idle because
+the 3090's memory rests warm.  The fix: `fan1` gets its own `CPU (radiator)` / `GPU (radiator)` / mix, with the GPU
+member **flat until 70 C** — it does not ramp for the 3090 below 70 C at all — and the exhaust member retuned to
+flat 32% below 50 C, topping out at 75% instead of 100%.
+
+Matched 6-minute windows, identical payload (30k prompt tokens, 8k generated, back-to-back):
+
+| | before (shared mix) | after (radiator fix) |
+| --- | --- | --- |
+| 3090 VRAM mean | 74.4 C | **73.9 C** |
+| 3090 VRAM min-max | 66 – 76 C | 62 – 78 C |
+| 3090 core mean | 57 C | 56 C |
+| card's own fan mean | 48 % | 49 % |
+| rear exhaust | 76.6 %, 1044 RPM | 58.6 %, **846 RPM (−19 %)** |
+| top forward exhaust | 78.1 %, 1100 RPM | 59.4 %, **873 RPM (−21 %)** |
+| top rear exhaust | 81.2 %, 1136 RPM | 64.5 %, **961 RPM (−16 %)** |
+| GPU intake (`fan5`) | 67.8 %, 1365 RPM | 66.9 %, 1358 RPM |
+| radiator pair (`fan1`) | not sampled | 47.2 %, 792 RPM |
+
+**The trade came out almost free: three exhausts roughly 20% slower, mean VRAM 0.5 C better, peak 2 C higher.** The
+GPU intake stayed where it was, which is the one that actually feeds the 3090.
+
+Caveat kept on the record: the intake/exhaust balance ratio (0.88 this run) **cannot** be compared against the
+earlier run, because the harness at that time did not sample `pwm1` at all — its "intake" was `fan5` alone.  The
+ratio is only comparable from now on.
 
 ### The mixes (`tools/coolercontrol/mix_profiles.py`) — applied 2026-10-20
 
