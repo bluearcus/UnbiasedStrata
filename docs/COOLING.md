@@ -21,16 +21,31 @@ the prose further down is background.
 
 | # | Item | Owner | Blocked on |
 | --- | --- | --- | --- |
-| O1 | Confirm the 3090's **own** fan channel reads *Unmanaged* in CoolerControl, so LACT and CoolerControl are not both driving the card | you, read-only | nothing — one minute |
-| O2 | Sustained soak, 12–15 min of continuous decode at 262K, to see whether VRAM actually reaches the 75–85 °C band where the intake curve overtakes its old BIOS pin of 57 % | assistant | your go-ahead: it occupies the model endpoint for ~15 min |
-| O3 | If the soak shows VRAM never getting there, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant, as a merge patch | outcome of O2 |
-| O4 | Create one **CPU-sourced Graph profile** | you, GUI | only the UI knows the CPU sensor's internal `temp_name`; this cannot be authored blind |
-| O5 | Mix Profiles for `fan1`/`fan3`/`fan4` (CPU curve vs VRAM curve, function `Max`) | assistant | the uid from O4 |
+| O1 | ~~Confirm the 3090's own fan channel reads Unmanaged~~ — **done, confirmed Unmanaged**, so LACT owns the card and CoolerControl does not | you | closed |
+| O2 | Sustained soak, 12–15 min of continuous decode at 262K — **moved to after O5** | assistant | the mixes change which fans are in play; tuning one curve first would be tuning twice |
+| O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
+| O4 | Create one **CPU-sourced Graph profile** — exact curve to type is below | you, GUI (~2 min) | only the UI knows the CPU sensor's internal `temp_name`; it cannot be authored blind |
+| O5 | Mix Profiles on `fan3`/`fan4`/`fan6` (CPU curve vs VRAM curve, function `Max`) — **tool written and tested, waiting only on O4** | assistant | O4 |
 | O6 | BIOS: `SYS_FAN5`/`SYS_FAN6` to fixed/ignore | you, at the next reboot | optional — no fighting observed yet, the duties track CoolerControl, not the firmware |
 
-### The one question to answer next
+### O4 in the GUI, exactly (about two minutes)
 
-O2: run the soak or not.  Everything else either has an owner already or depends on it.
+Profiles → add profile → type **Graph** → temperature source: the **CPU** sensor (pick the package sensor if the
+dropdown lists cores and a package) → name it `CPU Package` → curve:
+
+```
+30 → 15    40 → 25    50 → 40    60 → 55    70 → 70    80 → 85    90 → 100
+```
+
+Deliberately gentle at the bottom: this profile only ever *lifts* a fan above whatever the VRAM curve asks, because
+the mix takes the maximum — so a low floor costs nothing and a high floor would drown the case at idle.
+
+**Do not attach it to a channel. Do not touch `fan5`.** Save it and tell me nothing else — the mix script finds it by
+itself and prints what it matched.
+
+### The one thing to do next
+
+O4 in the GUI.  Then I run O5, and only then the soak.
 
 
 The number that matters on this rig is **memory temperature on the 3090**, not core temperature.  The card is
@@ -278,7 +293,36 @@ sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools
 sudo systemctl start coolercontrold
 ```
 
-## Verification checklist (items 1-3 done; 4 is O2 above)
+### The mixes (`tools/coolercontrol/mix_profiles.py`) — ready, waiting on O4
+
+A VRAM-only curve is wrong for a **shared** case fan: at CPU-only work the GPU is cool, so a VRAM-only curve lets an
+exhaust fan drop to ~50 % while nine CPU workers generate heat — `fan6`'s old BIOS pin was 70 %.  A Mix Profile
+computes both curves from their own sources and takes the higher duty, so no fan has to decide which component it
+serves.
+
+`fan3`, `fan4`, `fan6` → `Case Fans (CPU or VRAM)` = max of the CPU profile and the VRAM exhaust curve.
+`fan5` stays VRAM-only: its job is the GDDR6X and it is the only unobstructed intake.  `fan1` stays on its BIOS
+curve — it was never calibrated, and stalling two AIO radiator fans on an unknown duty floor is not a risk worth
+taking for a marginal gain; calibrate it first if the soak says we need it.
+
+The CPU profile is **discovered, not hard-coded**: the script looks for the single Graph profile whose temperature
+source is not the VRAM File sensor, and refuses if there is none — or lists what it saw and refuses if there is more
+than one.  Tested on a copy of the live config: refuses before O4 exists, discovers it after, replaces `fan6`'s
+existing assignment instead of duplicating the key (a duplicate key is invalid TOML and would take the config
+offline), rejects an ambiguous second Graph profile, backup-first, rollback on `coolercontrold check` failure,
+revert byte-for-byte.
+
+```bash
+sudo systemctl stop coolercontrold
+sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/mix_profiles.py plan
+sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/mix_profiles.py apply --start
+# undo:
+sudo systemctl stop coolercontrold
+sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/mix_profiles.py revert
+sudo systemctl start coolercontrold
+```
+
+## Verification checklist (items 1-3 done; item 4 runs after O5)
 
 1. `journalctl -u vram-sensor -n 20` → `... <- 72.0 C`, and `/run/vramsensor/vram.temp1` tracks it.
 2. CoolerControl Home: the `3090 VRAM` sensor charts, and matches LACT's `VRAM` reading.
