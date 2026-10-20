@@ -70,17 +70,20 @@ if ! : > "$CSV" 2>/dev/null; then
 fi
 
 sample_line() {
-  local vram cardfan core power util p3 p4 p5 p6 f3 f4 f5 f6 t
+  local vram cardfan core power util p1 p2 p3 p4 p5 p6 f1 f2 f3 f4 f5 f6 t
   vram=$(awk '{printf "%.1f", $1/1000}' "$VRAM_FILE" 2>/dev/null || echo "?")
   cardfan=$(nvidia-smi -q -i 0 2>/dev/null | awk -F: '/Fan Speed/{gsub(/ /,"",$2); print $2}')
   read -r power util core <<<"$(nvidia-smi --query-gpu=power.draw,utilization.gpu,temperature.gpu --format=csv,noheader,nounits -i 0 2>/dev/null | tr ',' ' ')"
+  p1=$(cat "$HW/pwm1" 2>/dev/null); p2=$(cat "$HW/pwm2" 2>/dev/null)
   p3=$(cat "$HW/pwm3" 2>/dev/null); p4=$(cat "$HW/pwm4" 2>/dev/null)
   p5=$(cat "$HW/pwm5" 2>/dev/null); p6=$(cat "$HW/pwm6" 2>/dev/null)
+  f1=$(cat "$HW/fan1_input" 2>/dev/null); f2=$(cat "$HW/fan2_input" 2>/dev/null)
   f3=$(cat "$HW/fan3_input" 2>/dev/null); f4=$(cat "$HW/fan4_input" 2>/dev/null)
   f5=$(cat "$HW/fan5_input" 2>/dev/null); f6=$(cat "$HW/fan6_input" 2>/dev/null)
   t=$(( $(date +%s) - START ))
-  printf 't=%4ds vram=%5s C core=%3s W=%5s util=%3s cardfan=%-4s | pwm3=%-3s(%2s%%) f3=%-4s | pwm4=%-3s(%2s%%) f4=%-4s | pwm5=%-3s(%2s%%) f5=%-4s | pwm6=%-3s(%2s%%) f6=%-4s\n' \
+  printf 't=%4ds vram=%5s C core=%3s W=%5s util=%3s cardfan=%-4s | pwm1=%-3s(%2s%%) f1=%-4s | pwm2=%-3s(%2s%%) f2=%-4s | pwm3=%-3s(%2s%%) f3=%-4s | pwm4=%-3s(%2s%%) f4=%-4s | pwm5=%-3s(%2s%%) f5=%-4s | pwm6=%-3s(%2s%%) f6=%-4s\n' \
     "$t" "$vram" "$core" "${power:-?}" "${util:-?}" "${cardfan:-?}" \
+    "$p1" "$(( ${p1:-0} * 100 / 255 ))" "$f1" "$p2" "$(( ${p2:-0} * 100 / 255 ))" "$f2" \
     "$p3" "$(( ${p3:-0} * 100 / 255 ))" "$f3" "$p4" "$(( ${p4:-0} * 100 / 255 ))" "$f4" \
     "$p5" "$(( ${p5:-0} * 100 / 255 ))" "$f5" "$p6" "$(( ${p6:-0} * 100 / 255 ))" "$f6" | tee -a "${CSV:-/dev/null}"
 }
@@ -123,10 +126,10 @@ for line in open(sys.argv[1]):
     m=re.search(r'vram=\s*([\d.]+) C', line)
     if not m: continue
     d={'vram':float(m.group(1))}
-    for k in ('pwm3','pwm4','pwm5','pwm6'):
+    for k in ('pwm1','pwm2','pwm3','pwm4','pwm5','pwm6'):
         mm=re.search(k+r'=\s*(\d+)\(', line)
         if mm: d[k]=int(mm.group(1))
-    for k in ('f3','f4','f5','f6'):
+    for k in ('f1','f2','f3','f4','f5','f6'):
         mm=re.search(r'\b'+k+r'=\s*(\d+)', line)
         if mm: d[k]=int(mm.group(1))
     mm=re.search(r'cardfan=\s*(\d+)', line)
@@ -139,8 +142,8 @@ print(f"3090 VRAM: peak {max(v):.1f} C  mean {statistics.mean(v):.1f} C  last {v
 if 'card' in rows[0]:
     c=[r['card'] for r in rows]; print(f"card fan:    peak {max(c)}%  mean {statistics.mean(c):.0f}%")
 print("header duty and tach:")
-pairs=[('pwm3','f3','fan3'),('pwm4','f4','fan4'),('pwm5','f5','fan5'),('pwm6','f6','fan6')]
-pins={'pwm3':203,'pwm4':205,'pwm5':147,'pwm6':178}
+pairs=[('pwm1','f1','fan1'),('pwm2','f2','fan2'),('pwm3','f3','fan3'),('pwm4','f4','fan4'),('pwm5','f5','fan5'),('pwm6','f6','fan6')]
+pins={'pwm1':134,'pwm2':133,'pwm3':203,'pwm4':205,'pwm5':147,'pwm6':178}
 stall={'fan3':16,'fan4':14,'fan5':20,'fan6':30}
 for p,f,ch in pairs:
     ds=[r[p] for r in rows if p in r]; fs=[r[f] for r in rows if f in r]
@@ -149,8 +152,21 @@ for p,f,ch in pairs:
     verdict=[]
     if hi < pins[p]: verdict.append(f"never exceeded its old BIOS pin {pins[p]} ({pins[p]*100//255}%)")
     else: verdict.append(f"exceeded its old BIOS pin {pins[p]} ({pins[p]*100//255}%)")
-    if lo*100//255 < stall[ch]: verdict.append(f"BELOW STALL FLOOR {stall[ch]}%")
+    if ch in stall and lo*100//255 < stall[ch]: verdict.append(f"BELOW STALL FLOOR {stall[ch]}%")
+    if ch not in stall: verdict.append("not calibrated - no stall floor known")
     print(f"  {p} ({ch}): {lo}-{hi} duty ({lo*100//255}-{hi*100//255}%)  tach {min(fs)}-{max(fs)} RPM  :: " + ", ".join(verdict))
+
+# Rough pressure balance.  Intake headers: pwm1 (a pair, counted twice) + pwm5.  Exhaust: pwm3 + pwm4 + pwm6.
+def mean(k):
+    v=[r[k] for r in rows if k in r]
+    return sum(v)/len(v) if v else 0
+in_duty = mean('pwm1')*2 + mean('pwm5')
+out_duty = mean('pwm3') + mean('pwm4') + mean('pwm6')
+if out_duty:
+    print(f"airflow balance (mean duty, radiator pair counted twice): intake {in_duty:.0f} vs exhaust {out_duty:.0f} -> ratio {in_duty/out_duty:.2f}")
+    print("  intake  = pwm1 (AIO radiator pair) + pwm5 (front bottom GPU intake)")
+    print("  exhaust = pwm3 (rear) + pwm4 (top forward) + pwm6 (top rear)")
+    print("  duty ratio is a proxy, not airflow: the radiator pair moves less air per percent than free-air fans")
 PY
 else
   log "no csv written"
