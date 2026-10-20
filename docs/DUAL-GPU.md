@@ -174,3 +174,26 @@ The two regimes where the pool *is* the limit, and where a faster kernel would p
 So the kernel work and the batching work are complements, not alternatives: alone, each is worth ~nothing on
 this hardware (single stream is GPU-bound; batching without a faster pool just halves each stream). Together
 they would make two streams GPU-bound again, i.e. roughly 2x the aggregate of one stream.
+
+## IQ3_S vs IQ3_XXS on this rig (measured)
+
+`tools/dual_gpu_quant_ab.sh`: serve mode, 262K, `--kv q4_0`, temp 0.7, one prompt, 3 requests per arm, all four
+arms in one session. The S pack was built with upstream's `iq_pack.py` and validated against the shipped S
+census (`tests/data/native_experts/iq3_s.txt`): 48 layers, 0 blob mismatches, 50.292 GB both ways. The
+expert profile was a straight copy of XXS's (the format is a pair ranking, quant-blind).
+
+| Arm | GPU-resident experts | tok/s | Acceptance |
+| --- | --- | --- | --- |
+| XXS, single | 9,454 (38%) | **84.5** | 69.1% |
+| XXS, peer | 14,752 (60%) | 81.9 | 59.4% |
+| S, single | 7,878 (32%) | 68.7 (61.5 / 73.3 / 71.3) | 66.0% |
+| S, peer | 12,409 (50%) | **73.5** (73.2 / 73.1 / 74.0) | 69.1% |
+
+What this establishes:
+
+* **S costs ~19% throughput alone, ~13% with the peer** - the predicted direction (bigger blobs, fewer slots,
+  more CPU work) at a smaller magnitude than feared.
+* **The peer's value grows with quantization size**: 0% for XXS (-3%, inside noise), **+7% for S**, and it also
+  **removes the tail** - S alone spread 61.5-73.3 tok/s, S with the peer 73.1-74.0. That is the CPU pool coming
+  near the critical path at S's blob sizes, exactly the mechanism the peer exists to absorb.
+* S at 73.5 tok/s with the peer is still ~13% below XXS's 84.5, so S is a **quality** purchase, not a speed one.
