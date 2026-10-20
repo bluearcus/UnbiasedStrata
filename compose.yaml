@@ -1,0 +1,51 @@
+# Docker Compose deployment of the dual-GPU peer tier.  See docs/DEPLOY-DOCKER.md.
+#
+#   docker compose build
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Quant selection: the defaults below are IQ3_XXS (fastest).  For IQ3_S (better quality, ~10% slower), override on
+# the command line:
+#   STRATA_MODEL=/models/flash-next/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+#   STRATA_PACK=/models/pack-iq3-s docker compose up -d
+name: strata
+
+services:
+  strata:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: unbiased-strata:0.1.45
+    # The nvidia container toolkit on this host cannot serve `--gpus`/device_requests: it tries to mount
+    # libnvidia-egl-wayland.so.1.1.21, which the driver no longer ships.  The legacy runtime + capability env
+    # variables work and are the correct set for a compute container (verified with both cards visible).
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      STRATA_MODEL: ${STRATA_MODEL:-/models/flash-next/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}
+      STRATA_PACK: ${STRATA_PACK:-/models/pack-iq3-xxs}
+      STRATA_MTP: ${STRATA_MTP:-/models/mtp}
+      STRATA_CTX: ${STRATA_CTX:-262144}
+      STRATA_KV: ${STRATA_KV:-q4_0}
+      STRATA_PEER_DEVICE: ${STRATA_PEER_DEVICE:-1}
+      STRATA_API_KEY: ${STRATA_API_KEY:-}
+    ports:
+      - "127.0.0.1:${STRATA_PUBLISH_PORT:-8080}:8080"
+    volumes:
+      - /home/mike/models:/models:ro
+    # CUDA host allocations and the 256K-context buffers want real shared memory, not the 64 MB default.
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    restart: unless-stopped
+    # The front end must be able to send QUIT and let the engine unload ~47 GB before the container dies.
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s

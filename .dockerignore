@@ -1,0 +1,11 @@
+# Build outputs are rebuilt inside the image; the model files live outside the repo and are bind-mounted.
+build
+build-*
+.git
+.gitmodules
+*.o
+*.a
+*.so
+**/CMakeFiles
+**/CMakeCache.txt
+docs/*.pdf

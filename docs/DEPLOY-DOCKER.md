@@ -35,14 +35,16 @@ Dockerfile
                 cmake --build /build --target strata unbiased-strata peer_p2p_probe -j N
 
   stage runtime nvidia/cuda:13.4.3-runtime-ubuntu24.04
-                apt: ca-certificates curl bash coreutils gawk     (the shim needs bash/awk; curl for the healthcheck)
+                apt: ca-certificates curl bash coreutils gawk tini  (shim needs bash/awk; curl = healthcheck)
                 COPY --from=build /build/strata /build/unbiased-strata /build/peer_p2p_probe /opt/strata/
                 COPY tools/strata-dual /opt/strata/
                 COPY docker/entrypoint.sh /usr/local/bin/strata-entrypoint
                 ENV STRATA_FRONTEND=/opt/strata/unbiased-strata \
                     STRATA_P2P_PROBE=/opt/strata/peer_p2p_probe \
                     CUDA_DEVICE_ORDER=PCI_BUS_ID
-                ENTRYPOINT ["/usr/local/bin/strata-entrypoint"]
+                ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/strata-entrypoint"]
+                # tini is belt-and-braces: the entrypoint already `exec`s the shim, so SIGTERM reaches the front
+                # end, which sends QUIT.  tini only reaps the engine if it ever outlives its parent.
 ```
 
 Why build inside the image rather than mount the host's `build-rk/`: reproducibility and a self-contained image are
@@ -90,7 +92,7 @@ services:
     ipc: host
     ulimits: { memlock: -1, stack: 67108864 }
     restart: unless-stopped
-    stop_grace_period: 60s
+    stop_grace_period: 120s            # the engine unloads ~47 GB on QUIT; 60 s was too tight
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
@@ -101,8 +103,11 @@ services:
 
 Two further choices to make explicit:
 
-- **Quant profiles.** Only one model can hold the VRAM, so expose `profiles: [xxs]` / `[s]` with the S service
-  overriding `STRATA_MODEL`/`STRATA_PACK` (`docker compose --profile s up`). Same image, no rebuild.
+- **Quant selection: one service, env override - not two profile services.** The first sketch here proposed
+  `profiles: [xxs]` / `[s]`, which is unsafe: an unprofiled service always starts, so `--profile s up` would launch
+  *both* engines and two models cannot share the VRAM. Instead `STRATA_MODEL`/`STRATA_PACK` are `${VAR:-default}`
+  in one service, so the quant is a one-line override and the two-engines case cannot be expressed:
+  `STRATA_MODEL=…IQ3_S… STRATA_PACK=/models/pack-iq3-s docker compose up -d`. Same image, no rebuild.
 - **Auth.** Bind to loopback and put `api_key` in the run config / `STRATA_API_KEY` only if something off-host will
   reach it; the compose ports line already keeps it on the host.
 
@@ -143,7 +148,8 @@ Two further choices to make explicit:
 
 ## 7. Order of work
 
-1. Write `docker/entrypoint.sh`, `Dockerfile`, `.dockerignore`, `compose.yaml` (nothing but files).
+1. Write `docker/entrypoint.sh`, `Dockerfile`, `.dockerignore`, `compose.yaml` (nothing but files).  Done; the
+   deviations from the first sketch above are deliberate and recorded.
 2. Build; fix only build errors (no tuning).
 3. Bring it up; run the validation checklist end to end.
 4. Add the `s` profile and re-run items 3-5 for it.
