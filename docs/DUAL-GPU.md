@@ -283,23 +283,23 @@ What this establishes:
   near the critical path at S's blob sizes, exactly the mechanism the peer exists to absorb.
 * S at 73.5 tok/s with the peer is still ~13% below XXS's 84.5, so S is a **quality** purchase, not a speed one.
 
-## Soak on the rebased engine (0.1.45): both quants, real context
+## Soak on the rebased engine (0.1.45), target config: both quants, real context
 
-Through `tools/strata-dual`, peer on, `--max-context 262144`, `--kv q4_0`, five varied prompts of 400 output tokens
-each (mix of explanation, code, design notes), `/health` read between requests:
+Through `tools/strata-dual`, peer on, **promotion off** (the default), `--max-context 262144`, `--kv q4_0`, five
+varied prompts of 400 output tokens each, `/health` read between requests:
 
 | Quant | tok/s per request | mean | vram slots | peer slots | p2p | ram/file reads |
 | --- | --- | --- | --- | --- | --- | --- |
-| IQ3_XXS | 88.1, 85.8, 86.5, 91.6, 84.1 | **87.2** | 9,407 | 5,339 (21.7%) | no | 0 / 0 |
-| IQ3_S | 79.2, 76.6, 74.8, 81.9, 75.0 | **77.5** | 7,869 | 4,534 | no | 0 / 0 |
+| IQ3_XXS | 98.5, 98.4, 85.4, 97.7, 110.4 | **98.1** | 9,407 | 5,313 | no | 0 / 0 |
+| IQ3_S | 84.6, 87.9, 81.5, 94.4, 96.1 | **88.9** | 7,869 | 4,534 | no | 0 / 0 |
 
-Both ran stable: tiers constant across requests (no slot drift, no OOM), `peer_hits` climbing (21k to 33k), no file
-reads, and the only `error` strings in the logs were the engine's benign `upload no error, sync no error` verify
-lines. The promotion pass settles at or near the peer's slot count (`nominated` 5,193 of 5,339 for XXS; 4,534 of
-4,534 for S), i.e. it re-sorts the tier over the first few requests and then stops.
+Both stable: tiers constant across requests, `peer_hits` climbing (69k to 339k on XXS), zero file reads, and the
+only `error` strings are the engine's benign `upload no error, sync no error` verify lines. `peer_nominated` stays
+0, as it should with the promotion pass off.
 
-For comparison, the same quant on the 0.1.39 branch measured 81.9 (XXS peer) and 73.5 (S peer): the rebase is worth
-~6% here and more at short context, where it is ~114 tok/s.
+**These supersede the earlier soak figures (XXS 87.2, S 77.5), which were measured with the promotion pass at
+96/1.5 - i.e. carrying its ~13-15% penalty.** Target configuration is therefore ~98 tok/s on XXS and ~89 on S at
+full 262K context, peer on.
 
 ## Regime-shift test: the workload every earlier benchmark missed
 
