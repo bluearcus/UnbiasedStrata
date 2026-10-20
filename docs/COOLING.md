@@ -22,10 +22,11 @@ the prose further down is background.
 | # | Item | Owner | Blocked on |
 | --- | --- | --- | --- |
 | O1 | ~~Confirm the 3090's own fan channel reads Unmanaged~~ — **done, confirmed Unmanaged**, so LACT owns the card and CoolerControl does not | you | closed |
-| O2 | Sustained soak, 12–15 min of continuous decode at 262K — **moved to after O5** | assistant | the mixes change which fans are in play; tuning one curve first would be tuning twice |
+| O2 | Sustained soak, 12 min — **done, results below** | assistant | closed |
+| O3 | Steepen the intake curve / the card's own fan curve to buy a few more degrees | you decide | see "Soak result" below |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
-| O4 | Create one **CPU-sourced Graph profile** — exact curve to type is below | you, GUI (~2 min) | only the UI knows the CPU sensor's internal `temp_name`; it cannot be authored blind |
-| O5 | Mix Profiles on `fan3`/`fan4`/`fan6` (CPU curve vs VRAM curve, function `Max`) — **tool written and tested, waiting only on O4** | assistant | O4 |
+| O4 | Create one **CPU-sourced Graph profile** — **done**: `CPU temp profile`, source `Package id 0` on `coretemp` (verified it is not the NVMe `Composite` sensor, which also exposes `temp1`) | you, GUI | closed |
+| O5 | Mix Profiles on `fan3`/`fan4`/`fan6` — **done**: `Case Fans (CPU or VRAM)`, `Max`, members `CPU temp profile` + `Top Rear Exhaust (VRAM)` | assistant | closed |
 | O6 | BIOS: `SYS_FAN5`/`SYS_FAN6` to fixed/ignore | you, at the next reboot | optional — no fighting observed yet, the duties track CoolerControl, not the firmware |
 
 ### O4 in the GUI, exactly (about two minutes)
@@ -43,9 +44,12 @@ the mix takes the maximum — so a low floor costs nothing and a high floor woul
 **Do not attach it to a channel. Do not touch `fan5`.** Save it and tell me nothing else — the mix script finds it by
 itself and prints what it matched.
 
-### The one thing to do next
+### The one thing left to decide
 
-O4 in the GUI.  Then I run O5, and only then the soak.
+O3, and it is a preference call rather than an engineering problem: VRAM now sits at **76–78 °C sustained** with
+`fan5` at 1480 RPM against a 1769 RPM calibrated maximum and the card's own fan at ~50 % of its scale.  We can leave
+it, or steepen the curves to buy a few more degrees in exchange for more noise.  The comparison that matters is
+against the original baseline of 78–80 °C with the card's fan pinned at 30–33 %.
 
 
 The number that matters on this rig is **memory temperature on the 3090**, not core temperature.  The card is
@@ -293,7 +297,31 @@ sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools
 sudo systemctl start coolercontrold
 ```
 
-### The mixes (`tools/coolercontrol/mix_profiles.py`) — ready, waiting on O4
+### Soak result (12 min, after the mixes) — `tools/cooling_soak.sh 12`
+
+Nine back-to-back completions, ~30k prompt tokens each, 8,000 generated each: **70,777 tokens in 760 s = 93.1 tok/s**
+including prefill, GPU pegged at ~299 W (the 300 W cap) and ~100 % utilisation for the whole window.
+
+| | value | old BIOS pin |
+| --- | --- | --- |
+| 3090 VRAM | **peak 78 °C, mean 75.4 °C, settled 76 °C** | — |
+| 3090 core | 57 °C | — |
+| card's own fan (LACT) | 48–51 % | — |
+| `pwm3` rear | 158–212 duty (61–83 %), 877–1137 RPM | 203 (79 %) — exceeded |
+| `pwm4` top forward | 161–217 (63–85 %), 935–1205 RPM | 205 (80 %) — exceeded |
+| `pwm5` GPU intake | 130–191 (50–74 %), 1092–1480 RPM | 147 (57 %) — exceeded |
+| `pwm6` top rear | 173–219 (67–85 %), 995–1214 RPM | 178 (69 %) — exceeded |
+
+No header dipped near its stall floor at any point, and every header ended up above the flat BIOS duty it used to be
+pinned to.  VRAM stopped climbing at 76–78 °C instead of running on to the 78–80 °C of the original baseline, where
+the card's own fan sat at 30–33 %.
+
+Remaining headroom: `fan5` reached 1480 RPM against a calibrated maximum of 1769, and the card's own fan only reached
+~50 % of its scale.  So there is more cooling available if we want it — that is a noise decision, not a safety one.
+
+
+
+### The mixes (`tools/coolercontrol/mix_profiles.py`) — applied 2026-10-20
 
 A VRAM-only curve is wrong for a **shared** case fan: at CPU-only work the GPU is cool, so a VRAM-only curve lets an
 exhaust fan drop to ~50 % while nine CPU workers generate heat — `fan6`'s old BIOS pin was 70 %.  A Mix Profile
@@ -322,7 +350,7 @@ sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools
 sudo systemctl start coolercontrold
 ```
 
-## Verification checklist (items 1-3 done; item 4 runs after O5)
+## Verification checklist (1–4 done: exporter, sensor graph, UI channel states, load test and soak)
 
 1. `journalctl -u vram-sensor -n 20` → `... <- 72.0 C`, and `/run/vramsensor/vram.temp1` tracks it.
 2. CoolerControl Home: the `3090 VRAM` sensor charts, and matches LACT's `VRAM` reading.
