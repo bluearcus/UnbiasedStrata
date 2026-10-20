@@ -24,9 +24,15 @@ while :; do
       exit 0
     fi
   done
-  if [ $(( $(date +%s) - start )) -ge "$T" ]; then
+  el=$(( $(date +%s) - start ))
+  if [ "$el" -ge "$T" ]; then
     echo "TIMEOUT after ${T}s waiting for '$PAT' in: $*" >&2
     exit 1
+  fi
+  # a heartbeat every 30 s: a long wait should look alive, not hung
+  if [ $(( el % 30 )) -eq 0 ] && [ "$el" -gt 0 ] && [ "$el" != "${last_hb:-}" ]; then
+    last_hb=$el
+    echo "  ... waiting ${el}s for '$PAT'${FILE_HINT:-}"
   fi
   sleep 1
 done

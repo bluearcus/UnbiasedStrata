@@ -112,6 +112,13 @@ Per-repeat B1 values overlap completely: off 81.9 / 84.1 / 84.1, promotion 86.1 
 "dip halves" reading (88.0 against 84.1) did not survive repetition - it was one sample of a distribution with a
 +/-4 tok/s spread. Both arms dip by the same ~8% at B1 and recover by B3.
 
+**Why the flat result is structural, not marginal.** Each layer waits for the slowest of primary GPU, peer and CPU
+pool, and the CPU pool is the tail (it serves ~40% of experts) while `peer_ms_wait` measures **0.14 ms/token** - the
+peer finishes and waits. So a promotion moves work between two stages that are both *ahead* of the critical path and
+pays two H2D copies (~0.3 ms) for it. The mechanism goes live only when the peer stops finishing early: a peer with a
+much worse bandwidth ratio (x4 rather than 1.67), a narrow PCIe link, or a configuration where the CPU tail shrinks
+(a smaller quantization such as Q2_0/IQ2_XS, fewer CPU-resident experts, or a much faster host).
+
 **Final verdict on the promotion pass:** the exchange fixed the *harm* (it is no longer monotone-negative), but
 there is nothing to win on this rig - the bandwidth gap between the 3090 and 4070 is real, yet the number of rows
 that would benefit is small and the copies cost about what they save. Default **off**; the code, the knobs and the
