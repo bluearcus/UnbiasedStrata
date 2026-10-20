@@ -41,6 +41,9 @@
 #include "strata/kernels/ple.hpp"
 
 #include <cstdio>
+#include <functional>
+
+#include "strata/core/vmm.hpp"
 #include <cstdlib>
 #include <cstdint>
 #include <string>
@@ -233,6 +236,9 @@ struct QsaState {
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
     int kv_mode = 0;
     int64_t n_slots = 0;
+    /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
+    /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
+    int32_t kv_elastic = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -276,11 +282,25 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
 /// resident state).
 void qsa_set_kv_resident(int64_t cells);
+/// THE ELASTIC K/V (--kv-grow; vmm.hpp).  A mode-0 state's K/V pools get addresses for every cell of the context but
+/// physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the context grows (from
+/// chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses never move, so the
+/// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
+void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
+bool qsa_kv_elastic();
+/// Cells every elastic state can hold now (INT64_MAX when none is elastic).
+int64_t qsa_kv_elastic_cells();
+/// Chunks still to map for every elastic state to hold `cells` cells.
+int64_t qsa_kv_elastic_need(int64_t cells);
+/// Maps them, each from `take()` (0: a new chunk), the new memory zeroed.  Synchronous; nothing may be running on
+/// the device.  false: out of memory.
+bool qsa_kv_elastic_grow(int64_t cells, const std::function<VmmChunk()>& take);
+/// Unmaps the chunks past `cells` cells, each handed to `give`.  Returns how many.
+int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(VmmChunk)>& give);
+/// Physical bytes the elastic pools hold, and what all of them would at the full context.
+uint64_t qsa_kv_elastic_mapped_bytes();
+uint64_t qsa_kv_elastic_full_bytes();
 int64_t qsa_kv_resident();
-/// Whether KV streaming applies to this geometry.  Dense attention (Qwen3.6, no indexer) reads every cell every
-/// token, so streaming would copy the whole KV over PCIe per token: false, with `why` for the CLI's refusal.
-/// `qsa_state_init` refuses the same way as a backstop.
-bool qsa_kv_streaming_applies(const ModelGeometry& g, std::string& why);
 /// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
 /// in whole blocks) must fit at once, with room to spare.
 int64_t qsa_kv_resident_min();
@@ -295,17 +315,12 @@ bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
-/// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell. Not with --kv-resident.
+/// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
 inline int qsa_kv_format(const QsaState& st) {
-    // A hybrid K8V4 state is mode 0 only and never reaches the block movers; refuse rather than let it
-    // fall through to kKvF16 - a wrong layout silently applied is worse than a hard stop (PR review).
-    if (st.kv_hybrid) {
-        std::fprintf(stderr, "strata: qsa_kv_format: a hybrid K8V4 state must never reach the block movers\n");
-        std::exit(1);   // the kernels' own "unsupported geometry" convention (kv_q8.cu, qsa_decode_attn.cu)
-    }
+    if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
@@ -483,34 +498,7 @@ void layer_set_fast_select(bool enabled);
 /// Plan v0.3 P6: whether the current decode configuration is the one the speculative verify window reproduces
 /// bit for bit (native projections, fused GR and GDN, split-K attention, block selection, native indexer).
 bool layer_verify_compatible(std::string& why);
-/// The same for a model's geometry: at `hc = 1` (Qwen3.6) there is no hyper-connection read to fuse and, without an
-/// indexer, no block selection and no native indexer to require.  The no-geometry form above is Flash-Next's.
-bool layer_verify_compatible(const ModelGeometry& g, std::string& why);
 uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b);
-
-// ================================ THE PLAIN BLOCK (hc = 1, Qwen3.6) ================================
-//
-// `hc = 1` (`ModelGeometry::hc`, set by the architecture string: docs/QWEN36-35B-A3B.md section 3.5) means NO
-// hyper-connections: `R` is one n_embd stream and the block is llama.cpp's `qwen35moe` pre-norm residual block
-//
-//     x = rms_norm(R) * attn_norm            -> mixer -> R += out
-//     x = rms_norm(R) * post_attention_norm  -> MoE   -> R += out          head: rms_norm(R) * output_norm -> output
-//
-// **IT IS A SECOND PATH CHOSEN BY `hc`, NOT THE GR PATH AT hc = 1.**  `gr_read` on one stream is not a plain norm
-// (its bottleneck gates the normed stream with a sigmoid and its norm weight is stored as `1 + w`), so the GR
-// kernels are never entered for this model; `block_layer_pre`, `block_layer_post`, `lm_head_mix` and the verify
-// window each branch on `g.hc == 1` to the two helpers below.  There is no pending write either: the residual is
-// added where the reference adds it, so `R` never lags between halves.
-//
-// The two helpers take a ROW COUNT so the verify window (T rows) and the single-token path (1 row) call the same
-// kernels: row t of the T-row call is bitwise the one-row call (the norm has independent per-row statistics in a
-// fixed reduction order; the add is elementwise).  tests/cuda/qwen36_block_test.cpp asserts that.
-
-/// `mixed[t] = rms_norm(R[t], eps) * w` over n_embd, for `n_tok` rows at stride n_embd (`w` is the F32 norm weight,
-/// n_embd long; ggml's `rms_norm` then `mul`).  `mixed` may equal `R` (in place) or must be disjoint.
-void plain_norm_rows(const float* R, const float* w, float* mixed, int64_t n_embd, float eps, int n_tok, void* stream);
-/// `R[t] += block_out[t]` over n_embd, for `n_tok` rows at stride n_embd.
-void plain_residual_rows(float* R, const float* block_out, int64_t n_embd, int n_tok, void* stream);
 
 // ================================ THE TWO ENDS OF A TOKEN ================================
 

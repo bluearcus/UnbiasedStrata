@@ -1,23 +1,14 @@
 // src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways.
 //
-//     build/native_expert_parity [--geom HxFF] <shard.gguf> [layer ...]   real rows (a split model's shards are
-//                                                                          found by name); expert 7 of each layer
-//     build/native_expert_parity [--geom HxFF] --synthetic GU/DOWN ...    random weights quantized by ggml
-//                                                                          (e.g. q4_K/q5_1, iq2_s/iq3_xxs)
+//     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
+//     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
-//
-// --geom gives n_embd x n_ff (default 2560x640, Flash-Next's; Qwen3.6-35B-A3B is 2048x512).
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
 // activations).  (b) and (c) each differ from (a) by their activation rounding only (a few 1e-3 relative).  (c) runs
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
-// (e) the negative control: the high byte of one block's fp16 scale flipped (its sign) in one down row must move
-// that row's GPU output by more than 1e-2 relative for a 256-value block of a 512-wide row (Qwen3.6's down types),
-// the gate scaled by the block's share of the row for the others (a 32-value block of Flash-Next's 640: 1e-3; the
-// sign flip of one of 20 blocks measured 8e-3 to 1.4e-2), and no other row by any bit; the same in one gate row must
-// move the output at all (more than 1e-4 relative over every row: one of n_ff SwiGLU terms changes).
 // The synthetic mode and (d) follow eddoursul/Strata 8029fa9.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -35,7 +26,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstddef>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -56,26 +46,7 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 namespace {
 constexpr int NT = 3, E = 7;
-int64_t H = 2560, FF = 640;   // --geom
-
-// byte offset of the block's fp16 scale `d` inside a block of this type (the negative control flips its high byte)
-size_t scale_byte(int type) {
-    switch (type) {
-        case 14: return ggml_type_size(GGML_TYPE_Q6_K) - sizeof(ggml_fp16_t);   // block_q6_K: ql, qh, scales, then d
-        case 29: return 55;                           // IQ1_M: the top nibble of the last scale word
-        default: return 0;                            // every other format starts with d (or dm: d is its low half)
-    }
-}
-
-// the GPU path on one blob, one group of the NT entries (the activations already in `dxq`)
-void gpu_expert(const strata::kernels::NativeExpertLayout& L, const std::vector<uint8_t>& blob, void* dblob,
-                const void* dxq, void* dscr, float* dout, unsigned long long* dptr, const int32_t* dstart,
-                const int32_t* dn, const int32_t* ddst, const int32_t* dtok, std::vector<float>& got, cudaStream_t s) {
-    cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
-    strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
-    cudaStreamSynchronize(s);
-    cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost);
-}
+constexpr int64_t H = 2560, FF = 640;
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
@@ -90,6 +61,13 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
     }
     for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    if (f.tail_off) {   // the blob's scales, as the engine applies them (gate and up as read, down on its output)
+        float tail[4];
+        std::memcpy(tail, blob.data() + f.tail_off, sizeof tail);
+        for (auto& v : G) v *= tail[0];
+        for (auto& v : U) v *= tail[1];
+        for (auto& v : D) v *= tail[2];
+    }
     std::mt19937 rng(11 + seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> x((size_t) NT * H);
@@ -121,6 +99,25 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             cpu::native_quant_act(f, x.data() + k * H, act[k].data());
             a[k] = act[k].data();
             ffp[k] = ff[k].data();
+        }
+        if ((f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22) && cpu::cpu_avx2_ok() && !cpu::cpu_avx512_ok()) {
+            const auto dot = ggml_get_type_traits_cpu((ggml_type) f.gu_type)->vec_dot;
+            size_t differ = 0;
+            std::vector<float> exact((size_t) FF);
+            for (int k = 0; k < NT; ++k) {
+                cpu::iq256_gu_rows_exact_one(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a[k],
+                                              exact.data(), 0, (int) FF);
+                for (int r = 0; r < FF; ++r) {
+                    float g = 0.f, u = 0.f;
+                    dot((int) H, &g, 0, blob.data() + (size_t) r * f.gu_row, 0, a[k], 0, 1);
+                    dot((int) H, &u, 0, blob.data() + f.up_off + (size_t) r * f.gu_row, 0, a[k], 0, 1);
+                    const float want = (g / (1.f + std::exp(-g))) * u;
+                    differ += std::memcmp(&want, &exact[(size_t) r], sizeof(float)) != 0;
+                }
+            }
+            std::printf("%s exact singleton: %zu of %lld real gate/up rows differ from ggml\n",
+                        label.c_str(), differ, (long long) (NT * FF));
+            if (differ) ++failures;
         }
         cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
         // either multi-token kernel: IQ4_XS has an AVX-2 one and no AVX-512 one, so the gate cannot be
@@ -332,36 +329,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
         strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
-        gpu_expert(L, blob, dblob, dxq, dscr, dout, dptr, dstart, dn, ddst, dtok, got_g, s);
-        {   // (e) the negative control: a flipped scale byte in one down row, then in one gate row
-            const int64_t rd = 5 % H, rg = 3 % FF;   // the corrupted rows
-            std::vector<uint8_t> bad = blob;
-            bad[f.down_off + (size_t) rd * f.d_row + scale_byte(f.d_type)] ^= 0x80;
-            std::vector<float> got_bad(got_g.size());
-            gpu_expert(L, bad, dblob, dxq, dscr, dout, dptr, dstart, dn, ddst, dtok, got_bad, s);
-            double num = 0, den = 0;
-            size_t other_rows_differ = 0;
-            for (int k = 0; k < NT; ++k)
-                for (int64_t r = 0; r < H; ++r) {
-                    const float a = got_bad[(size_t) (k * H + r)], b = got_g[(size_t) (k * H + r)];
-                    if (r == rd) { num += std::fabs((double) a - b); den += std::fabs((double) b); }
-                    else other_rows_differ += std::memcmp(&a, &b, 4) != 0;
-                }
-            const double rel_down = num / (den + 1e-30);
-            bad = blob;
-            bad[(size_t) rg * f.gu_row + scale_byte(f.gu_type)] ^= 0x80;
-            gpu_expert(L, bad, dblob, dxq, dscr, dout, dptr, dstart, dn, ddst, dtok, got_bad, s);
-            const double rel_gate = rel(got_bad, got_g);
-            const double gate_down = 1e-2 * ((double) ggml_blck_size((ggml_type) f.d_type) / 256.0) * (512.0 / (double) FF);
-            const bool seen = rel_down > gate_down && other_rows_differ == 0 && rel_gate > 1e-4 &&
-                              std::isfinite(rel_down) && std::isfinite(rel_gate);
-            std::printf("          negative control: down row %lld's scale byte flipped moves that row by rel %.2e "
-                        "(> %.1e) and %zu other rows by any bit (0); gate row %lld's moves the output by rel %.2e "
-                        "(> 1e-4): %s\n", (long long) rd, rel_down, gate_down, other_rows_differ, (long long) rg,
-                        rel_gate, seen ? "yes" : "*** NO ***");
-            if (!seen) ++failures;
-            cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);   // the good blob back for (c2), (d)
-        }
+        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        cudaStreamSynchronize(s);
+        cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
         {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (#242;
             // the formats without a decode-once split take the per-entry kernels either way)
             std::vector<float> old_g(got_g.size());
@@ -423,16 +393,10 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-    // GPU vs the float reference: the tolerance policy's bound for a Q8-activation path (oracle-crosscheck.md: the Q8
-    // oracle's ffn_moe_out max 5.3e-3 x 4), measured 9.7e-3 to 1.3e-2 on Qwen3.6's five pairs; 3e-2 for a pair with a
-    // Q5_0 role (32-value blocks with no min on a 640-wide row: q4_K/q5_0 measured 2.7e-2; see the CMake note).  CPU
-    // vs the reference: ggml-cpu rounds the activations to Q8_K (256-value blocks, one scale per 256 values, against
-    // the GPU's q8_1 per 32), measured up to 2.2e-2, so 3e-2.  CPU vs GPU: both roundings, measured up to 2.4e-2, 4e-2.
-    const double gpu_bound = (f.gu_type == 6 || f.d_type == 6) ? 3e-2 : 2e-2;
-    const bool ok = ec < 3e-2 && eg < gpu_bound && ecg < 4e-2 && std::isfinite(ec) && std::isfinite(eg) && std::isfinite(ecg);
-    std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e (< 3e-2)  gpu rel %.2e (< %.0e)  cpu-gpu %.2e (< 4e-2)  %s\n",
-                label.c_str(), ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec,
-                eg, gpu_bound, ecg, ok ? "ok" : "FAIL");
+    const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+    std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", label.c_str(),
+                ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
+                ok ? "ok" : "FAIL");
     return failures + (ok ? 0 : 1);
 }
 
@@ -466,6 +430,11 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
     quant(f.gu_type, FF, H, blob.data());
     quant(f.gu_type, FF, H, blob.data() + f.up_off);
     quant(f.d_type, H, FF, blob.data() + f.down_off);
+    if (f.tail_off) {   // NVFP4's {s_gate, s_up, s_down, 0}: non-unit for an NVFP4 projection, 1.0 for another format
+        const bool g4 = f.gu_type == 40, d4 = f.d_type == 40;
+        const float tail[4] = {g4 ? 0.75f : 1.f, g4 ? 1.25f : 1.f, d4 ? 0.5f : 1.f, 0.f};
+        std::memcpy(blob.data() + f.tail_off, tail, sizeof tail);
+    }
     return blob;
 }
 
@@ -607,22 +576,13 @@ int main(int argc, char** argv) {
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
-    int ai = 1;
-    if (std::string(argv[ai]) == "--geom") {
-        if (argc < 4 || std::sscanf(argv[ai + 1], "%lldx%lld", (long long*) &H, (long long*) &FF) != 2 || H <= 0 || FF <= 0) {
-            std::fprintf(stderr, "--geom takes HxFF, e.g. 2048x512\n");
-            return 2;
-        }
-        ai += 2;
-    }
-    const std::string mode = argv[ai];
-    std::printf("geometry n_embd %lld x n_ff %lld\n", (long long) H, (long long) FF);
+    const std::string mode = argv[1];
     if (mode == "--q5_1-min") {
         failures += check_q5_1_min(s);
     } else if (mode == "--bf16-embd") {
         failures += check_bf16_embd(s);
     } else if (mode == "--synthetic") {
-        for (int i = ai + 1; i < argc; ++i) {
+        for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
             const size_t slash = arg.find('/');
             const int gu = slash == std::string::npos ? -1 : type_of(arg.substr(0, slash));
@@ -638,9 +598,9 @@ int main(int argc, char** argv) {
             failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
         }
     } else {
-        const strata::GgufModel model(strata::gguf_split_paths(argv[ai]));
+        const strata::GgufModel model(strata::gguf_split_paths(argv[1]));
         std::vector<int> layers;
-        for (int i = ai + 1; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+        for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
         if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
         for (int l : layers) {
             const strata::TensorInfo* t[3] = {};

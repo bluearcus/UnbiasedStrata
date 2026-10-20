@@ -19,13 +19,11 @@
 
 namespace strata::prefill::fused {
 
-/// One layer's native expert geometry (cpu::NativeFmt's fields the kernels read).  The widths are the model's
-/// (Flash-Next 2560 / 640, Qwen3.6 2048 / 512): n_embd a multiple of 256, n_ff of 64, and 2 n_ff a multiple of 256.
+/// One layer's native expert geometry (cpu::NativeFmt's fields the kernels read; n_embd 2560, n_ff 640).
 struct NativeGeom {
     int gu_type = -1, d_type = -1;    ///< ggml types
     size_t gu_row = 0, d_row = 0;     ///< bytes per gate/up row and per down row
     size_t up_off = 0, down_off = 0;  ///< inside the blob
-    int64_t n_embd = 2560, n_ff = 640;
 };
 
 /// enabled() (STRATA_PF_FUSED=1 on sm_80+), and the kernels cover this gate/up and down pair on this device.
@@ -36,7 +34,8 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 
 /// experts() for native blobs: b.blob[e - e0] is the native blob of expert e (gate at 0, up at g.up_off, down at
 /// g.down_off; 2-byte aligned).  `xa` from quantize_act_native; H in `ha` (act_bytes(n, 640)); down into `dm` at the
-/// rows of `group`.
+/// rows of `group`.  `dm` 16-byte aligned (gfx12 stores float4; checked there - the prompt path's buffers are 256-aligned
+/// through Alloc's 256-byte takes from a 256-aligned cache slot or cudaMalloc).
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream);
 

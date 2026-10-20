@@ -1,261 +1,175 @@
-# UnbiasedStrata
+## Credits and license
 
-[Strata](https://github.com/Niko1221/Strata)'s inference engine and llama.cpp's tokenizer, chat-template and
-HTTP code, built into one binary that serves Qwen3.8-Flash-Next (one 24 GB+ card, 128 GB RAM) and
-Qwen3.6-35B-A3B (any single NVIDIA card from 6 to 32 GB, Pascal or newer) over an OpenAI-style API. No
-network is needed to build or run it: rsync the source, run `make build`, start the binary. No Python, no
-installer.
+The engines are PolyStrata's, by VecSzn and contributors, built on [Strata](https://github.com/Niko1221/Strata) by
+Niko1221. The front end is built from [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)'s server, common and
+mtmd code. Qwen3.8-Flash-Next and Qwen3.6-35B-A3B are by the Qwen team; the IQ3_XXS GSQ-RCO file is
+[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)'s, the Qwen3.6 files are
+[Unsloth](https://huggingface.co/unsloth)'s. Upstream's full credits: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits).
+MIT License ([LICENSE](LICENSE)); some parts and every model have their own licenses
+([which ones](docs/HOW_IT_WORKS.md#license)).
 
-## Requirements
+# UnbiasedStrata 2 - note from a human.
 
-| | Build | Run |
-| --- | --- | --- |
-| Network access | no | no |
-| CMake 3.24+, C++20 compiler (tested: g++ 13.3) | yes | no |
-| CUDA | toolkit 12.x (tested: 12.4 and 12.8; 12.8+ for RTX 50; CUDA 13 dropped Pascal and Volta) | `libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12` and the NVIDIA driver |
 
-Hardware: Linux, x86-64 with AVX2, one NVIDIA card.
+Issues with Strata / PolyStrata:
 
-| Model | Card | RAM |
-| --- | --- | --- |
-| Qwen3.8-Flash-Next | 24 GB or more (RTX 30, 40 or 50) | 128 GB |
-| Qwen3.6-35B-A3B | 6 to 32 GB, Pascal (GTX 10 series, sm_61) or newer, one card | enough to hold the experts the card does not: 32 GB for Q4_K_XL on an 11 GB card, 16 GB for IQ3_XXS (the table under Sizing) |
+* piping instructions from markdown into agent == bad idea
+* replacing components at build-time or runtime isn't great
+* desired: clone; submodule init; make; situation
 
-The model can be on a local disk or on a network volume; what the card does not hold is read into RAM at
-start, and what RAM does not hold is read from the file on a miss, so a slow store costs start-up time and,
-on the small cards, decode speed.
+UnbiasedStrata aims to be the suckless (dwm) variant of Strata.
 
-## Build
+It's been vetted in a few ways:
+* agents went through and verified kernels to the difference between CPU/GPU within llama.cpp
+* full a run of Qwen 3.8 Flash Next over Bob-bench wide test set with a high score.
+
+
+This wouldn't exist without llama.cpp.
+
+without Niko's Strata.
+
+Without PolyStrata either.
+
+Use at your own risk. Works on my machine.
+
+
+# AI generate nonsense from here on out
+
+
+
+A fork of [PolyStrata](https://github.com/VecSzn/PolyStrata) v0.1.45-poly.1 that keeps its two inference engines
+unchanged and replaces everything around them: no installer, no downloads at build or start, no Python between a
+request and a token. One `make build` on a Linux box with an NVIDIA card produces the engines and a C++ front end,
+`unbiased-strata`, that serves an OpenAI-style chat API from llama.cpp's own server code. The target is one NVIDIA GPU,
+Pascal or newer, CUDA 12.x, Linux x86-64, on a machine that may have no network at all. What was changed and why is in
+[UPSTREAM.md](UPSTREAM.md); the plan this follows is [PLAN.md](PLAN.md).
 
 ```
-rsync -a UnbiasedStrata/ host:UnbiasedStrata/   # or: git clone, then git submodule update --init
-ssh host 'cd UnbiasedStrata && make build'      # produces build/unbiased-strata
+git clone <this repo> && cd UnbiasedStrata
+git submodule update --init          # shallow, third_party/llama.cpp @ robertkarl/llama.cpp UnbiasedStrata (a6de9af3)
+make build                           # build/bin/{strata,strata-poly,libstrata_kq.so,unbiased-strata}
+make test                            # the front end against a fake engine; no GPU, no model
 ```
-
-The tree is 6 MB plus the pinned llama.cpp submodule in `third_party/` (about 170 MB checked out). The
-build fetches nothing. `make build JOBS=N` sets the job count; `CUDA_ARCHS` defaults to
-`61;70;75;86;89;120`, one binary for every card from Pascal up, minus any architecture the installed
-`nvcc` cannot compile (12.4 has no 120, 13 has no 61 or 70; the build says what it dropped). `make build
-CUDA_ARCHS=61` builds for one card in about 3 minutes. An architecture below 75 in the list turns on
-`STRATA_EXPERIMENTAL_SM60`, the Pascal/Volta build (FP32 and dp4a paths; no tensor cores). The
-chat-parser patch in `patches/` is applied to the submodule at configure time.
 
 ## Run
 
 ```
-# Qwen3.8-Flash-Next
-./unbiased-strata --model /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
-                  --pack /models/pack-iq3-xxs --mtp /models/mtp
-# Qwen3.6-35B-A3B at the full 262,144-token context (the engine sizes itself to the card; see Sizing)
-./unbiased-strata --model /models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-                  --pack /models/qwen36-q4 --mtp /models/qwen36-mtp-draft --ctx 262144 -- --kv q4_0
+unbiased-strata --engine <strata|strata-poly|path> -m <model.gguf> [llama-server options] -- <engine options>
 ```
 
-| | |
-| --- | --- |
-| Endpoints | `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`, on `127.0.0.1:8080` |
-| Options | `--ctx N` (32768), `--threads N` (default: physical cores, or half the CPU quota in a container), `--host`, `--port`, `--mmproj PATH`, `--vision-tokens N` (1024); engine flags after `--`: `--kv fp16\|q4_0\|int8`, `--vram-cap MiB` and `--ram-cap GiB` (plan as a smaller card or host), `--expert-cache N`, `--prompt-cache N` (checkpoints kept between requests) |
-| Sampling | greedy unless `temperature` > 0 |
-| Reasoning | returned as `reasoning_content`; `"reasoning_effort": "none"` turns it off |
-| Tools | OpenAI format (`tools`, `tool_calls`) |
-| Images | with `--mmproj`, OpenAI `image_url` parts holding a base64 `data:image/...` URL (PNG, JPEG, BMP or GIF), several per message |
-| Not supported | more than one GPU, batch requests |
+`-m` names the GGUF the vocabulary and chat template are read from; no tensors are loaded from it by the front end.
+`--engine` takes a path, or a bare name looked up beside the program. Everything before `--` is a `llama-server`
+option (`--host`, `--port`, `--api-key`, `--alias`, `--temp`, `--top-k`, `--top-p`, `--min-p`,
+`--reasoning-format`, `--chat-template-kwargs`, `--sse-ping-interval`, ...); everything after `--` goes to the
+engine, which is started as a child process with `--serve` added and spoken to over its line protocol
+([docs/BACKENDS.md](docs/BACKENDS.md)). The server answers `/v1/chat/completions` (streaming and not), `/v1/models`,
+`/health`, `/props`, `/tokenize`, `/detokenize`, as llama.cpp's server does, one request at a time.
 
-Images: `--mmproj /models/mmproj-Qwen3.8-Flash-Next-BF16.gguf` loads the model's own vision encoder (from the same
-Hugging Face repository as the GGUF; 0.9 GB). The encoder runs on the CPU, so the card keeps its expert cache:
-about 25 s and 1,000 prompt tokens for a 1-megapixel screenshot on 8 threads, 0.2 s for a small image; a repeated
-image is served from a cache. `GET /v1/models` then lists `image` under `input_modalities`. Without `--mmproj` an
-image request is refused with a 400.
+```
+build/bin/unbiased-strata --engine build/bin/strata-poly \
+  -m /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --host 127.0.0.1 --port 18091 --alias qwen3.6-35b-a3b-ud-q3_k_m \
+  -- --model /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf --max-context 32768 \
+     --expert-profile /models/expert-profile-q3km.txt --tail-skip 6
+```
 
-The engine runs as a child process. When it exits or its stall watchdog fires, the front end exits with a failure
-status, for a supervisor such as systemd (`Restart=on-failure`) to restart; `/health` and `/v1/models` answer 503
-while the engine is down. Reasoning streams as it is generated; content and tool calls are sent once the whole
-message is parsed, so a partial tool-call JSON never changes arguments already sent. `make test-frontend` checks
-the child handling and the protocol without a model; `make test-chat-parser MODEL=<shard 1>` checks the chat
-template and tool-call parsing against the real GGUF.
+With pictures, add `--mmproj /models/mmproj-F16.gguf` (the projector from the same `-MTP` repository) and
+`--threads N` for the encoder before the `--`. The front end checks the projector's width against the model's at
+start, encodes each picture with llama.cpp's mtmd and hands the rows to the engine over upstream's `GENI`
+protocol. A picture is at most 300 rows by default (upstream's installer's CPU setting; `--image-max-tokens`
+changes it), which read a 1920x1080 dashboard correctly in 15 s of encoding on a Ryzen 7 1700.
 
-## The supported models
+**Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS** (`strata`; the two GGUF shards, the pack directory made from shard 1, the MTP
+draft directory). On the 24 GB card:
 
-### Qwen3.8-Flash-Next
+```
+build/bin/unbiased-strata --engine build/bin/strata \
+  -m /models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
+  --host 127.0.0.1 --port 18090 --alias qwen3.8-flash-next-iq3_xxs --sse-ping-interval 10 \
+  -- --pack /models/pack-iq3-xxs \
+     --native /models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
+     --ple-gguf /models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf \
+     --expert-profile /models/pack-iq3-xxs/expert-profile.bin \
+     --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp /models/mtp \
+     --max-context 65536 --kv int8 --ple-io ram --pool-workers 15 --kv-resident 32768
+```
 
-Qwen3.8-Flash-Next (125B parameters, mixture of experts), the full model at IQ3_XXS quantization, from
-[ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
-directory `IQ3_XXS`, revision `ed59f920`. No other model, quantization or pruned variant is supported. The
-draft (MTP) head is required.
 
-Everything below must be on disk before start. Nothing is fetched.
+### Preparing a Flash-Next pack
 
-| What | Size | SHA-256 or source |
+`strata-poly` reads a GGUF as it is. `strata` needs a pack directory and an MTP draft directory made once, offline
+except for the draft download, with upstream's tools (`tools/requirements.txt`: numpy, regex; `gguf-py` comes from the
+submodule). This is what upstream's installer ran; it has not been re-run in this fork, which used the pack and MTP
+directory upstream's installer made on 2026-10-05 (`docs/MODEL-FILES.md`).
+
+```
+python tools/iq_pack.py --gguf <shard1> --out <pack>             # --compat-bf16 for Unsloth files
+STRATA_SOURCE=huggingface python tools/mtp_fetch.py fetch --out <mtp>
+python tools/mtp_pack.py --src <mtp> --experts q2_0 --out <mtp>/mtp-q2_0.gguf
+python tools/mtp_rt.py --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt
+cp data/draft_vocab.bin <mtp>/rt/draft_vocab.bin
+```
+
+Model files themselves are downloaded on a machine with network access and copied to the inference box; the fork does
+not fetch them. The files that have been served, with sizes and SHA-256, are in
+[docs/MODEL-FILES.md](docs/MODEL-FILES.md).
+
+## Measured
+
+Each number came from a run directory with the command, the raw client output, the server log and the model files'
+checksums; the per-run records were removed from the tree on 2026-10-19 and are in git history at commit 7551f138 (`git checkout 7551f138 -- bench/unbiased bench/results`). What stays in `bench/` is
+reusable tooling only: upstream's `bench_vs_llama.py` and its corpus, the kernel probes, and `bench/correctness/`, the
+teacher-forced harness of the correctness checks. Tokens per second, median of 3 runs. Upstream is PolyStrata v0.1.45-poly.1 with its Python
+server, on the same card, the same files, the same client, back to back.
+
+**Upstream versus this fork, RTX 3090, 2026-10-18** (the step-9 record, in history at 7551f138; the client is
+upstream's `tools/strata_bench.py --runs 3 --long` plus a three-document sustained supplement):
+
+| Model | Workload | upstream | fork |
+| --- | --- | --- | --- |
+| Flash-Next IQ3_XXS, 64K ctx | chat decode | 87.1 | 103.1 |
+| | sustained decode, 512 tokens | 105.1 | 119.1 |
+| | prefill 4K / 16K / 32K | 1924 / 2342 / 2393 | 2065 / 2531 / 2616 |
+| | agent turn decode | 110.6 | 116.8 |
+| Qwen3.6 UD-Q3_K_M, 32K ctx | chat decode | 220.8 | 213.5 |
+| | sustained decode, 512 tokens | 207.6 | 200.0 |
+| | prefill 4K / 16K | 3652 / 3570 | 3822 / 3486 |
+| | agent turn decode | 194.0 | 186.9 |
+
+Flash-Next: the fork is ahead on every workload. Qwen3.6: decode is within the run-to-run range; 16K prefill is 2.3 %
+slower with non-overlapping ranges and is recorded as an open finding. The two engines were built separately in the
+two trees, so an engine-build difference is not excluded.
+
+**pi on a fixed coding task** (pi 0.85.1, Flash-Next on the 3090, three runs a side, `…-step9/row3/`): every run
+completed the task. Generated tokens per wall-clock second, the whole run: upstream 72.1, fork 76.6 (medians); the raw
+wall times (36.3 vs 44.7 s) follow the length of each sampled trajectory.
+
+**Short-prompt decode through the fork, first end-to-end runs** (`…-step6/`, 2026-10-17; ranges over the smoke
+requests, not medians of a benchmark):
+
+| Model | RTX 3090 | RTX A6000 |
 | --- | --- | --- |
-| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf` (weights) | 47.04 GB | `219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15` |
-| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf` (n-gram table), beside shard 1 | 28.80 GB | `316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113` |
-| Pack: `index.txt`, `dense.bin`, `native_experts.txt`, `conversions.json`, `expert-profile.bin` | 1.5 GB | made once with upstream's tools; not published yet |
-| Draft head: `experts.bin`, `dense.bin`, `dense.txt`, `draft_vocab.bin` | 0.8 GB | made once with upstream's tools; not published yet |
+| Qwen3.6 UD-Q3_K_M | 211 to 227 | 214 to 235 |
+| Qwen3.6 UD-IQ4_XS | 205 to 245 | 207 to 215 |
 
-About 78 GB in total. The commands that make the pack and draft head, and the SHA-256 of every file they
-produce, are in [UPSTREAM.md](UPSTREAM.md).
+Greedy answers to the same prompt were identical on the two boxes and identical to upstream on the pod for both
+Flash-Next and Qwen3.6 (text and token count). Against llama.cpp at the pinned commit (PLAN.md step 12,
+harness `bench/correctness/`, record in history at 7551f138, 2026-10-18 on the A6000): teacher-forced on 16 sequences per model, both engines' per-step
+distributions are as close to llama.cpp's GPU run as llama.cpp's own CPU run is (mean KL 0.6 to 1.2x that spread on every
+set and arm), and the greedy token agrees at every position with a 0.5-nat margin except a handful of near ties per arm
+(Qwen3.6: 4 of 2,700; Flash-Next: 0 to 4 of about 2,880 depending on the arm). The findings, each with a ticket, are in
+that directory's README: upstream's own `poly_expert_parity` exceeds its bound on one expert; speculation is not bitwise
+inert above 4-token windows (it passes the KL gate); `strata`'s bits depend on the free VRAM at start when not every
+expert fits the card. Extended 2026-10-19 to DeepSeek V4 Flash UD-IQ2_XXS and GLM 5.3 Flash 3.0bit on a 2x RTX PRO 6000 pod (section 8 of that record): T2 holds on every set and arm, 0.69 to 1.13x llama.cpp's own CPU-vs-GPU spread; a handful of 0.5-nat-margin flips per model where both llama.cpp runs agree (USTRAT-10); on GLM the draft block's VRAM moves 52 experts to the CPU, so its answers are not bitwise the no-draft ones (USTRAT-9); and llama.cpp master's CPU run differs from the pinned commit's by as much as the engine does, so the DeepSeek numbers are against 3cf03257 specifically (USTRAT-11).
 
-### Qwen3.6-35B-A3B
+**Model acceptance (PLAN.md step 13, 2026-10-19).** A coding agent (pi 0.85.1, in a container with tools, sampled as
+the model card asks) completed four work items through the fork's server with every served model: a Markdown
+table-of-contents CLI with tests, an HTTP key-value store with persistence, three planted bugs, and a browser
+Minesweeper that a headless browser can play; Minesweeper again at temperature 1.0. Flash-Next IQ3_XXS and Qwen3.6
+UD-Q3_K_M on an RTX 3090 and Qwen3.6 UD-IQ4_XS on the A6000 pass as is (the IQ4_XS temperature-1.0 page threw a
+`ReferenceError` of the agent's own making); DeepSeek V4 Flash UD-IQ2_XXS and GLM 5.3 Flash 3.0bit on a B200 pass
+after the two fixes under "Known limits" (argument order; GLM's architecture name in the vocabulary load). The
+API-only checks (`frontend/tests/acceptance-real-engine.sh`) hold decode and prompt reading within 15 % of step 9 on
+the 3090 (Flash-Next with the installer's `--pool-workers 15`; 24 costs 14 %) and record the first B200 figures
+(72 and 74 tok/s decode on one card). Record: the step-13 directory, in history at 7551f138. pi's compaction defaults (reserve 16K, keep the last 20K tokens) assume a window well above 64K: against a server at `--max-context 32768` a long pi session compacts to no effect and then sends `max_tokens: 1` ("Response was truncated before completion"); serve 128K or more to pi, or lower pi's `compaction` settings (USTRAT-8).
 
-Qwen3.6-35B-A3B (35B parameters, 3B active: 40 layers, 256 experts of which 8 route per token, 30 Gated
-DeltaNet layers and 10 full-attention layers, 262,144-token context), unsloth's UD quantizations from
-[unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) and
-[unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF). Two
-quantizations, with the pack and draft pack made by this repository's own tools (`tools/iq_pack.py`,
-`tools/make_profile.py`, `tools/mtp_qwen36_pack.py`; commands and every file's SHA-256 in
-[UPSTREAM.md](UPSTREAM.md)):
 
-| What | Size | SHA-256 |
-| --- | --- | --- |
-| `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, **the default** (K-quants: the fast AVX2 path for the experts the CPU computes) | 22.36 GB | `707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450` |
-| `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` from the **-MTP** repository (the same trunk plus the draft block `blk.40`; serves as the model file too) | 22.85 GB | `55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1` |
-| `Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`, for 6 and 8 GB cards | 13.21 GB | `9c964e657212fea1f24905dd7b0a89b82fd807d19fab0b41da14251b07b88fbe` |
-| Pack `qwen36-q4/` or `qwen36-iq3/` (`index.txt`, `dense.bin`, `native_experts.txt`, `conversions.json`, `expert-profile.bin`, `tokenizer/`) | 65 MB | per file in UPSTREAM.md |
-| Draft pack `qwen36-mtp-draft/` (`experts.bin`, `dense.bin`, `dense.txt`, `native_experts.txt`, `mtp.json`, `draft_vocab.bin`), cut from the -MTP file's draft block; serves both quantizations | 0.5 GB | per file in UPSTREAM.md |
-
-No other Qwen3.6 file is accepted: the IQ4_XS-MTP file's draft block (Q3_K experts) and the 27B dense model
-are refused by name. Images work with `--mmproj` and the model's own encoder (`mmproj-F16.gguf` from the -MTP repository,
-899 MB); the encoder runs on the CPU, so the first use of a full-screen image costs 24 s on an i9-9900K and
-about 70 s on a Ryzen 7 1700, and repeats are served from a cache.
-
-#### Sizing
-
-At start the engine prints its plan for the card it finds: the fixed set for the requested context (the
-dense weights, the drafter, the KV cache, the session, a reserve), then every remaining megabyte as expert
-slots, filled by the route-trace profile's rank. If the fixed set does not fit, the KV cache is streamed
-to RAM above a resident window, then the context is lowered toward 131,072, then the engine refuses with
-the numbers and suggests the IQ3_XXS file. It never silently picks a shorter context. The experts that do
-not fit in VRAM are read from pinned RAM when the host has it, else from the file on a miss; `/health`
-reports the VRAM hits, RAM reads and file reads per request. `--vram-cap` and `--ram-cap` make a big card
-plan like a small one.
-
-| VRAM | Q4_K_XL at 262,144, q4_0 KV: fixed set, experts resident | IQ3_XXS: fixed set, experts resident |
-| --- | --- | --- |
-| 24 GB (RTX 4090) | 4,823 MiB; 9,980 of 10,240 (97%) | 4,331 MiB; all 10,240, 8.8 GB spare |
-| 11 GB (GTX 1080 Ti) | 4,461 MiB; 3,575 (35%) | 4,019 MiB; 6,748 (66%) |
-| 8 GB | 1,949 (19%) | 3,873 (38%) |
-| 6 GB | 598 (6%) | 1,486 (15%) |
-
-The 24 GB row is measured; the others are the planner's figures from the same files under `--vram-cap`
-(docs/qwen36-port/step2-notes.md section 5, step4-pack.md section 5).
-
-**RAM is a requirement, not a tier.** The engine assumes the card and the host RAM together hold the expert set;
-every expert the card does not hold is pinned in RAM. What the host must hold is the expert bytes minus the card's
-share, plus the engine's own 3 to 4 GB and the OS:
-
-| VRAM | Q4_K_XL experts off the card | RAM to have | IQ3_XXS experts off the card | RAM to have |
-| --- | --- | --- | --- | --- |
-| 24 GB | none | 8 GB | none | 8 GB |
-| 16 GB | 8 GB | 16 GB | none | 8 GB |
-| 11 GB | 13 GB | 32 GB (24 is tight) | 4 GB | 12 GB |
-| 8 GB | 15 GB | 32 GB | 7 GB | 16 GB |
-| 6 GB | 17 GB | 32 GB | 9 GB | 16 GB |
-
-Below those figures the engine still starts, maps the rest from the file and says so in its plan, but that is a
-fallback, not a supported configuration: measured once on the GTX 1080 Ti at Q4_K_XL under a 12 GiB memory bound,
-decode fell from 52 tokens/s to 12 to 15, the NVMe's rate, with about 12 experts per token read from the file.
-
-## Status
-
-Checked on one machine: RTX 3090, 32 vCPUs of an EPYC 7763, 125 GB RAM, CUDA 12.8, in a container.
-
-| | |
-| --- | --- |
-| Build | from an rsynced tree with no git metadata; the binary holds no download code |
-| Serving | chat, streaming, reasoning, tool calls; a coding agent (pi) wrote and ran a program through it |
-| RTX 4090 (24 GB), 82 GB RAM, Debian, bare metal | serving with tool calls and images, through pi (file attachments and clipboard paste) and curl, over several days of use |
-| Start from local disk | 19 s with the files in the OS file cache |
-| Start from a network volume | 12 min for 76 GB (S3-backed RunPod volume, 120 to 330 MB/s). The volume refused reads twice with "cannot allocate memory"; the loader retried and went on |
-| Not tested | RTX 50 cards; a cold start from local disk |
-
-Qwen3.6-35B-A3B, checked on the RTX 4090 (VM, 16 vCPU i9-9900K, 62 GB RAM, CUDA 12.4):
-
-| | |
-| --- | --- |
-| Correctness | the engine's logits held to a numpy reference and to llama.cpp at every position of the real files (greedy top-1 64/64 on three prompts at IQ3_XXS, 61-64/64 at Q4_K_XL, mean KL 1e-3 to 7e-3); the expert-miss path (what every card below 24 GB runs on) held with the same prompts under `--vram-cap` |
-| Serving | chat, streaming of reasoning and answer per token, tool calls streamed and not, multi-turn prompt checkpoints at 262,144 context, at 24 GB, under an 11 GB cap (Q4_K_XL) and a 6 GB cap (IQ3_XXS); a coding agent (pi) wrote and ran a program through it |
-| Pascal | built and unit-tested on a GTX 1080 Ti (sm_61: every kernel parity test, the pack, the drafter, the verify window); the expert-miss path held to llama.cpp's logits there too |
-
-Speed against llama.cpp on the same card (RTX 4090, `--vram-cap` for the smaller budgets, 262,144 context,
-no RAM cap, drafter on; llama.cpp with `--n-cpu-moe N` chosen to fit the same budget, no speculation). Decode
-is a 1,200-token answer to a 2.4K prompt; prefill is a 32K prompt. Tokens/s, engine / llama.cpp:
-
-| Budget | Q4_K_XL decode | Q4_K_XL prefill | IQ3_XXS decode | IQ3_XXS prefill |
-| --- | --- | --- | --- | --- |
-| 24 GB | 251 / 159 (1.6x) | 4,319 / 8,604 (0.50x) | 318 / 167 (1.9x) | 4,426 / 8,245 (0.54x) |
-| 16 GB | 180 / 41 (4.4x) | 4,232 / 1,798 (2.4x) | 319 / 44 (7.3x) | 4,401 / 2,637 (1.7x) |
-| 12 GB | 122 / 38 (3.3x) | 3,877 / 1,475 (2.6x) | 256 / 40 (6.4x) | 4,381 / 2,223 (2.0x) |
-| 11 GB | 104 / 37 (2.8x) | 3,723 / 1,420 (2.6x) | 234 / 39 (6.1x) | 4,375 / 2,137 (2.1x) |
-| 8 GB | 64 / 33 (2.0x) | 3,003 / 1,212 (2.5x) | 135 / 34 (4.0x) | 4,320 / 1,854 (2.3x) |
-| 6 GB | 45 / 30 (1.5x) | 517 / 1,108 (0.47x) | 81 / 32 (2.5x) | 1,121 / 1,713 (0.65x) |
-
-The llama.cpp 24 GB Q4_K_XL row is at 131,072 context; it does not load at 262,144 with every layer on the card.
-Prompt processing is the weak side: with every expert resident llama.cpp is twice as fast, and at 6 GB the engine
-spends the prompt copying experts to the card. Full tables, profiler windows and plots are in the regina
-repository's `analysis/qwen36-35b-single-gpu-ladder/engine-4090/`.
-
-On the GTX 1080 Ti (VM, 14 vCPU of a Ryzen 7 1700, 52 GB RAM), against llama.cpp on the same card and host
-(`--n-cpu-moe N` at the lowest N that fits each budget, 8 threads, no speculation, the model file in RAM).
-262,144 context on both sides. Tokens/s, engine / llama.cpp:
-
-| Budget | Q4_K_XL decode | Q4_K_XL prefill 3.1K | Q4_K_XL prefill 32K | IQ3_XXS decode | IQ3_XXS prefill 3.1K | IQ3_XXS prefill 32K |
-| --- | --- | --- | --- | --- | --- | --- |
-| 11 GB (the card) | 66 / 28 (2.4x) | 941 / 570 (1.7x) | 462 / 545 (0.85x) | 81 / 33 (2.5x) | 910 / 904 (1.0x) | 453 / 714 (0.63x) |
-| 8 GB (`--vram-cap 8192`) | 54 / 25 (2.1x) | 911 / 488 (1.9x) | 442 / 487 (0.91x) | 69 / 28 (2.5x) | 900 / 747 (1.2x) | 453 / 637 (0.71x) |
-| 6 GB (`--vram-cap 6144`) | 42 / 24 (1.8x) | 361 / 452 (0.80x) | 265 / 460 (0.58x) | 55 / 24 (2.3x) | 748 / 614 (1.2x) | 437 / 562 (0.78x) |
-
-Decode is 1.8 to 2.5 times llama.cpp; the GPU computes 85% of the decode window against llama.cpp's 39 to 45%.
-A long prompt is slower than llama.cpp at every budget on this card. The draft head is worth a third of the decode
-speed (49 tokens/s without drafts at Q4_K_XL on the full card). Tables and plots: regina
-`analysis/qwen36-35b-single-gpu-ladder/engine-1080ti/` and `llama-1080ti-52g/`.
-
-Speed, one run of each, same machine and model files, greedy sampling, reasoning off. Generation is the mean
-of 8 different prompts of 400 tokens; prompt speed is the mean of 2 different prompts of about 20,000 tokens.
-
-| | Generation, tokens/s | Prompt, tokens/s |
-| --- | --- | --- |
-| This fork | 107 (87 to 116) | 2,483 |
-| Upstream, with `--pool-workers 15 --ple-io ram` | 78 (61 to 93) | 2,439 |
-| Upstream, arguments as its installer writes them | 20 (16 to 21) | 2,368 |
-
-Upstream as installed started 127 CPU workers on the container's 32 vCPUs and read the n-gram table from
-disk per token; the middle row removes both. The remaining gap to the fork is not explained yet: the two
-builds differ in compile flags and in how the n-gram table is held in RAM, and each row is a single run.
-
-## Known problems
-
-- Text in a message that looks like a control token (`<think>`, `<tool_call>`) is tokenized as that control
-  token. Upstream's tokenizer keeps it as plain text.
-- Replies are not reproducible token for token between runs or between this fork and upstream, even with
-  greedy sampling, so "same output" cannot be checked by comparing text.
-  For Qwen3.6-35B-A3B the cause is traced: an expert the card does not hold is computed by a different
-  kernel on the CPU, and the cache keeps changing which experts those are for the first few requests; replies
-  diverge only where two tokens are within about 0.3 logits, and every state holds to llama.cpp's logits.
-  `--adapt-every 0 --suffix-draft 0` makes a request repeat token for token. `--pcie-frac 1.0` does too
-  only while a layer misses fewer than 16 experts per window; past that the rest are computed on the CPU.
-- Qwen3.6-35B-A3B: between user turns the prompt cache reuses the previous prompt but not the previous reply,
-  because the model's template re-renders an earlier reply without its reasoning. Tool loops reuse nearly
-  everything (1,867 of 1,948 tokens in a pi session); `chat_template_kwargs.preserve_thinking` with
-  `reasoning_content` sent back reuses the reply too, at the cost of keeping old reasoning in context.
-  A tool call arrives as one delta, not streamed. Images are checked on one screenshot only, and not
-  against llama.cpp; the RTX 50 and Volta builds have not
-  run on a card. Prompt processing is slower than llama.cpp with every expert on the card, at 6 GB, and for long
-  prompts on a GTX 1080 Ti.
-
-## Compared with upstream Strata (6f32ec0)
-
-| | Upstream | This fork |
-| --- | --- | --- |
-| Engine source (`src/`, `include/`) | 272 files | 58 files changed for the Qwen3.6 port (the model geometry read from the GGUF, the plain-residual block, dense attention, the SiLU-gated DeltaNet, the expert kernels for the UD quantizations, the VRAM planner, the drafter pack) plus retrying reads from slow stores; docs/qwen36-port/ has the per-step notes |
-| Build | clones llama.cpp during CMake | pinned submodule, fetches nothing; one patch, applied at configure time: tool-call arguments in any order (see UPSTREAM.md) |
-| Setup | Python installer downloads the model and builds the pack and draft head | none; files must already exist |
-| Server | Python | C++, in the same binary (`frontend/`), with the image encoder from llama.cpp's `mtmd` |
-| Python | 33,745 lines | 0 |
-| C, C++ and CUDA | 208,254 lines (with tests and the Intel port) | 84,086 lines |
-| Tracked files | 851, 27 MB | 292, 6 MB |
-| Configurations | several models, NVIDIA, AMD and Intel, Linux and Windows, multi-GPU | two models, one NVIDIA card (Pascal to RTX 50), Linux |
-
-## Credits and licence
-
-MIT, as upstream. The engine is the work of Niko1221 and the Strata contributors; see [LICENSE](LICENSE) and
-[UPSTREAM.md](UPSTREAM.md). llama.cpp and ggml are MIT. The model files have their own licences.

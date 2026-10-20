@@ -4,119 +4,161 @@
 
 | What | Where | Version |
 | --- | --- | --- |
-| Engine | https://github.com/Niko1221/Strata | commit `6f32ec070f23ced9f50e704d854d775da52591ab`, engine 0.1.39 |
-| ggml (CPU backend, CUDA matrix kernels) | https://github.com/ggml-org/llama.cpp, as the submodule `third_party/llama.cpp` | commit `3cf03257f219afbe7334045ff7c6a06ac68c627d`, the one upstream Strata pins |
+| Engines (`strata`, `strata-poly`), tools, docs | https://github.com/VecSzn/PolyStrata | tag `v0.1.45-poly.1`, commit `d0cd84dc6bd009d1d9e2191e4e28cc76b80f1ee3` |
+| ggml, llama, common, mtmd, cpp-httplib | https://github.com/robertkarl/llama.cpp, branch `UnbiasedStrata`, as the submodule `third_party/llama.cpp` | commit `a6de9af3b19b5e3a5397f2c835a29a13c37664bd`: ggml-org `3cf03257f219afbe7334045ff7c6a06ac68c627d` (the commit upstream pins) plus the two parser commits below |
 
-The first commit of this repository is the upstream snapshot as published. One file was not imported:
-`bench/results/2026-09-30-community-rtx-5090/engine.log`, which upstream's own ignore rules exclude.
-`git diff <first commit> HEAD -- src include CMakeLists.txt` shows every change to the engine and its build.
+Commit `0197ae86` ("Import PolyStrata v0.1.45-poly.1 (d0cd84dc) unmodified") is the upstream tree, every tracked
+file, with the same tree hash as upstream's commit. `git diff 0197ae86 HEAD` is the whole story of this fork;
+`git diff 0197ae86 HEAD -- src include` is every change to the engines.
 
-## What this fork changed
+The history before that commit is UnbiasedStrata 1, a fork of Niko1221/Strata 0.1.39, ended at the tags
+`unbiasedstrata-1` and `unbiasedstrata-1-muse-spark-native`.
 
-- **Build:** ggml is taken from the submodule. Upstream cloned llama.cpp during the build.
-- **Removed:** the Python installer and launchers, the Python server and web app, the Python tools, the
-  Intel SYCL port, Docker files, benchmark results, the test suite, translations, and all docs except
-  `docs/upstream/DETAILS.md` and the paper.
-- **Added:** `frontend/`, the C++ front end (tokenizer, chat template, output parser and HTTP API, using
-  llama.cpp's code from the submodule), and a build target that links it with the engine into one binary.
-- **ggml / llama.cpp common (`third_party/llama.cpp`):** one change, kept as
-  `patches/llama.cpp-qwen3-coder-any-argument-order.patch`, applied to the submodule's working tree at CMake
-  configure time (and by `make build`); Qwen3.6's template routes to the same parser:
-  the Qwen3-Coder tool-call grammar accepts a call's arguments in any order. Upstream requires the
-  required arguments first; Qwen3.8 Flash-Next often writes the optional ones first (`limit`, `offset`,
-  `path`), and because the grammar's tool-call group is optional and has no end anchor, such a call was
-  dropped silently: the client got `finish_reason=stop` and an empty answer (2026-10-08).
-- **Engine source (`src/`, `include/`):** three changes, all for loading from a slow or remote store. The
-  engine's own program is compiled into the binary with its entry point renamed; the front end starts it
-  as a child process.
-  - `include/strata/platform/robust_read.hpp` (new): positional reads that retry an error a network store
-    gives for a moment, and lower the number of parallel readers while it does.
-  - `src/core/expert_source.cpp`: the expert loader reads through it, reports progress, and names the file,
-    offset and error when it fails.
-  - `src/kernels/ngram.cpp`: `--ple-io ram` reads the n-gram table into memory of its own with 16 readers,
-    where upstream locked the file mapping (which fails under a container's `ulimit -l`).
+## Rules
 
-Code paths for other models, AMD cards and Windows are still present in the engine source. They are not
-built by `make build`, not tested and not supported here.
+A thing is removed only when it (1) reaches the network during setup, build or start-up, (2) puts Python
+between a request and a token, (3) breaks or complicates the one-command build, or (4) is marketing.
+Everything else stays, built or not. Engine changes are bug fixes for the target (Linux x86-64, one NVIDIA
+GPU, Pascal or newer, CUDA 12.x), each recorded below with the file, the reason and the measurement.
 
-## Prepared model files
+## Build (`CMakeLists.txt`, `Makefile`, `.gitmodules`, `.gitignore`)
 
-The pack and the draft head are produced once with upstream Strata's tools at the commit above. These are
-the commands that were used, with `U` an upstream checkout, `G` this repository's
-`third_party/llama.cpp/gguf-py`, and Python 3 with `numpy` and `regex`:
+- **ggml from the submodule, not a fetch.** `STRATA_GGML_DIR` defaults to `third_party/llama.cpp` and the
+  configure stops with the `git submodule update --init` line if `ggml/CMakeLists.txt` is missing. Upstream's
+  `FetchContent` of llama.cpp (the only network access of its build) is deleted. The three later
+  `if(STRATA_GGML_DIR)` blocks are unchanged; their `else()` branches are now dead. `.gitignore` no longer
+  ignores `/third_party/llama.cpp*`.
+- **llama.cpp changes are commits on a fork, not configure-time patches.** The submodule points at
+  robertkarl/llama.cpp, branch `UnbiasedStrata`: ggml-org `3cf03257` plus the two commits under "Changes to llama.cpp"
+  below. Until 2026-10-19 the same changes were `patches/*.patch`, applied to the submodule's working tree by CMake at
+  configure (UnbiasedStrata 1 did it in `make` and in CMake both), which left the submodule dirty after every build and
+  meant the pinned commit alone did not name the sources compiled. The pin now does; `git status` is clean after a build.
+- **llama.cpp's libraries for the front end.** A second `add_subdirectory` of the submodule with
+  `LLAMA_BUILD_COMMON` and `LLAMA_BUILD_MTMD` on and tests, tools, examples, server, app, UI, prebuilt UI,
+  OpenSSL and llguidance off. It reuses the ggml targets configured above. Gated by `STRATA_FRONTEND` (default on),
+  not by CUDA, so the front end also builds on a machine without a GPU.
+- **The front end, `unbiased-strata`.** Seven of llama.cpp's `tools/server` files are compiled unmodified from the
+  submodule into a static library (`server-http`, `server-queue`, `server-task`, `server-common`, `server-chat`,
+  `server-schema`, `server-stream`): the HTTP layer, the task queue, the OpenAI request and result types, SSE
+  framing, the request schema. The eighth, `server-context.cpp`, is bound to `llama_context` and is replaced by
+  `frontend/strata_context.cpp`, which runs the engine as a child process over its line protocol (`docs/BACKENDS.md`)
+  and uses a vocab-only `llama_model` for tokenizing, the chat template and the output parsers. `server-http.cpp`
+  references the web UI's asset table (`ui.h`, generated by `tools/ui` at build time, which downloads); `frontend/
+  ui_stub/` provides an empty one. No patch to llama.cpp was needed for this; the undocumented internal API of
+  `tools/server` is used as it is at the pinned commit.
+- **`Makefile`.** `make build` configures once and builds `strata`, `strata-poly`, `strata_kq` and `unbiased-strata`
+  into `build/bin/`, not upstream's `all`, which also builds about 70 parity and bench programs. `make frontend`
+  builds the front end alone without CUDA into `build-frontend/`; `make test` builds and runs the front end's tests
+  there against a fake engine (`frontend/tests/`): the adapter's cases and the HTTP surface a coding agent touches.
+  The nvcc check applies only to the `build` and `configure` goals.
+  `CUDA_ARCHS` defaults to `61;75;86;89`; an arch below 75 adds upstream's `STRATA_EXPERIMENTAL_SM60`
+  (upstream's default is `120`, which needs CUDA 13). `PORTABLE=1` gives the AVX2 baseline instead of
+  `-march=native`. One GCC for the C, C++ and nvcc host sides: the Makefile probes `g++-15`, `g++-14`, ... with
+  `nvcc -ccbin` and passes the newest accepted one as `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER` and
+  `CMAKE_CUDA_HOST_COMPILER`. Without that, on a box whose default `g++` is newer than nvcc accepts (Debian 13 with
+  CUDA 12.4: GCC 14 against a GCC 13 limit), the C++ files were compiled by GCC 14 and the CUDA files by GCC 13, and
+  `strata` failed to link on `__cxa_call_terminate` (upstream's installer handles the same case, its #1645).
+  `HOSTCXX=/usr/bin/g++-13` overrides the probe.
 
-```
-export STRATA_GGUF_PY=$G
-# the pack, from the model's first shard (the second must be beside it)
-python $U/tools/iq_pack.py --gguf Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --out pack-iq3-xxs
-cp $U/data/expert-profile.bin pack-iq3-xxs/
+## Front end behaviour (`frontend/`), where it differs from llama-server or from upstream's server
 
-# the draft head, from the original checkpoint's 31 draft-head tensors (about 5 GB, fetched over HTTP)
-python $U/tools/mtp_fetch.py fetch  --out mtp-bf16
-python $U/tools/mtp_fetch.py verify --out mtp-bf16
-python $U/tools/mtp_pack.py --src mtp-bf16 --experts q2_0 --out mtp-bf16/mtp-q2_0.gguf
-python $U/tools/mtp_rt.py --gguf mtp-bf16/mtp-q2_0.gguf --out mtp
-cp $U/data/draft_vocab.bin mtp/
-```
+Recorded here because a client written for one of the two may notice.
 
-The model shards used were revision `ed59f92082b1e93c0e96d60a8b11aab089b52f09` of
-ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF, verified against their published SHA-256 checksums. The
-prepared files have not been published yet. Building them twice gave the same bytes; their SHA-256:
+- **`/health`** returns llama.cpp's `{"status": "ok", "busy": ...}` plus upstream's `"service": "strata"`,
+  `"loaded": true`, `"model"`, `"max_context"` (commit 453d3015). Upstream's `tools/strata_bench.py` refuses a server
+  without the first two; the first step-9 fork arm was lost to that
+  (the step-9 record's README; records are in history at 7551f138, `bench/unbiased/`).
+- **Streams always end with a usage chunk** (empty `choices`, `usage`, `timings`), as upstream's server does,
+  whether or not the client sent `stream_options.include_usage`; llama-server sends it only on request (96f4ef1f).
+  Same reason: the bench client reads `prompt_tokens` from it.
+- **One slot.** Requests are served one at a time in arrival order, as upstream's server does with one engine.
+- **No constrained decoding.** `response_format` and tool schemas are parsed and used for output parsing, not
+  enforced at the sampler, because the engine samples; logged once per such request.
+- **Pictures are encoded in the front end** (`--mmproj FILE`, commit 71886db0 and after): llama.cpp's mtmd runs the
+  projector and the front end writes upstream's `SVE1` record file and sends `GENI … image_pad=<id> <file>`, the
+  protocol upstream's Python server spoke to `strata-vision`. Projector width is checked against the model's
+  embedding width at start. The default row budget is upstream's installer's (300 on the CPU, 1024 on the GPU;
+  `--image-max-tokens` overrides). The encoder runs on the CPU: the front end's ggml is built without CUDA, and
+  `--mmproj-gpu` is refused when ggml has no GPU device (17e27213). Measured in
+  2026-10-18 on the A6000 (record in history at 7551f138).
+- **`--sse-ping-interval`** is llama-server's (default 30 s); the measured Flash-Next runs used 10.
+- **SIGTERM exits 1**, not 0, after stopping the engine: the engine child dies with the process group and the front
+  end reports it as an engine death with an empty message. Open; matters only to a service manager.
+- **Default `min_p`** is llama-server's 0.05 when a request omits it; upstream's server sends none. pi sends 0.
 
-```
-68beec784ea64aeecace591b33debb8ba331a9ad257a3e1b68c5c701dd22b267  pack-iq3-xxs/conversions.json
-d2af3d8331e5c7a1985d1d589747230f9d56719a6d33c7cddc9ee6b81cde6b13  pack-iq3-xxs/dense.bin
-8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf  pack-iq3-xxs/expert-profile.bin
-1afe12b36cd2d13bf122b741fa0e81e1f751319cc3c451e54ba75524d825f148  pack-iq3-xxs/index.txt
-ae28cf7a2a1c9063c4b55d6c8cf86d4d079dcddcf597f9e8697c9157d462c0ee  pack-iq3-xxs/native_experts.txt
-c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a  mtp/dense.bin
-991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd  mtp/dense.txt
-b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91  mtp/draft_vocab.bin
-09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f  mtp/experts.bin
-```
+## Changes to llama.cpp (robertkarl/llama.cpp, branch `UnbiasedStrata`)
 
-## Prepared files for Qwen3.6-35B-A3B
+Two commits on top of ggml-org `3cf03257`; `git -C third_party/llama.cpp diff 3cf03257 HEAD` is exactly these.
 
-Made with this repository's own tools (Python 3 with `numpy`; `STRATA_GGUF_PY` at `third_party/llama.cpp/gguf-py`),
-from unsloth's files: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` and `Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf` of
-[unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF), and the `-MTP` repository's
-`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (41 blocks; the draft block is `blk.40`) for the draft pack.
+- `9547d8d` (`common/parsers/qwen3-coder.cpp`): the Qwen3-Coder
+  tool-call grammar accepts a call's arguments in any order. Upstream takes the required ones first and the
+  optional ones after; Qwen3.8 Flash-Next often writes the optional ones first (`limit`, `offset`, `path`), and
+  because the grammar's tool-call group is optional and has no end anchor, such a call was dropped silently:
+  the client got `finish_reason=stop` and an empty answer (UnbiasedStrata 1, 2026-10-08, REGINA-104). Qwen3.6's
+  template routes to the same parser. Carried over from UnbiasedStrata 1 unchanged.
+- `a6de9af` (`common/chat-auto-parser-generator.cpp`, `common/parsers/deepseek.cpp`): the same for every
+  template the auto-generated PEG grammar serves (DeepSeek V4 Flash's DSML, GLM 5.3 Flash's `<arg_key>` form, and
+  the rest). Upstream accepts the required arguments only in the schema's order, which holds when its own sampler
+  is constrained by the grammar; this engine samples unconstrained, and both models wrote `content` before `path`
+  for a `write` tool that declares `path` first, so a finished, well-formed call was reported to the client as
+  "output does not match the expected peg-native format" (PLAN.md step 13, 2026-10-19, USTRAT-7). Whether every
+  required argument is present is left to the tool, as upstream already leaves it for optional-only tools.
 
-```
-export STRATA_GGUF_PY=$PWD/third_party/llama.cpp/gguf-py
-# the pack, one per model file (the tokenizer, the dense weights' index, the expert table, the route profile)
-python3 -I tools/iq_pack.py --gguf Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --out qwen36-q4
-python3 -I tools/iq_pack.py --gguf Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf --out qwen36-iq3
-cp data/qwen36-expert-profile.bin qwen36-q4/expert-profile.bin        # tools/make_profile.py from the route trace
-cp data/qwen36-expert-profile.bin qwen36-iq3/expert-profile.bin
-# the draft pack, from the -MTP file's draft block; serves either trunk
-python3 -I tools/mtp_qwen36_pack.py --gguf Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf --out qwen36-mtp-draft
-```
+## Engine source (`src/`, `include/`)
 
-`--draft-vocab none` leaves `draft_vocab.bin` out (the drafter then scores the whole vocabulary: a few percent
-higher acceptance, 345 MiB more VRAM for the head). Building twice gives the same bytes. SHA-256:
+No changes: `git diff 0197ae86 HEAD -- src include` is empty (checked 2026-10-18). The engines measured in step 9 are
+these sources built in this tree; their binaries differ from upstream's build of the same sources, and the step-9
+record says so where it matters.
 
-```
-9c964e657212fea1f24905dd7b0a89b82fd807d19fab0b41da14251b07b88fbe  Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf
-707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
-55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf (the -MTP repository's file)
-7c20e11993ff853fe5698843d610b2a87927b04f9a4607551f4e023a39bc71ba  qwen36-q4/conversions.json
-53467f9b49bbc57d570eb8802125144dd4b4d7fd6a658d685ef72005d75a5f4f  qwen36-q4/dense.bin
-eb2ed6c8d86ebe0c16bb7a09af6c24fc4059627cc95e35def07c41568a30283c  qwen36-q4/expert-profile.bin
-1a4725f13e24691a3d6fd10dba4bb6cb217c4831ff8d5529865fc01f39413c79  qwen36-q4/index.txt
-257d84e2d36a2e6572cd0dd8382283defe28bc07c2c97ece22ab6c1bd2f5bff4  qwen36-q4/native_experts.txt
-39bf397e3fb8591ab84cb9142dbd43f665c3bff456e9772c47dc04db5ca28195  qwen36-iq3/conversions.json
-53467f9b49bbc57d570eb8802125144dd4b4d7fd6a658d685ef72005d75a5f4f  qwen36-iq3/dense.bin
-eb2ed6c8d86ebe0c16bb7a09af6c24fc4059627cc95e35def07c41568a30283c  qwen36-iq3/expert-profile.bin
-685d475659736b415a5801413f116a4371970d3cb24b16e53625b98019895c73  qwen36-iq3/index.txt
-820053214b08d3eab1378705fb7c345a724ed0fe16544df07b2f519423bb10e8  qwen36-iq3/native_experts.txt
-4a93092f5716d289367b97ce107d8b08b2236a8e1954bc7f746881875c73d03a  qwen36-mtp-draft/dense.bin
-dd5990d0ef0926252cad59090fa1d00f138db2e3f316eb96691db83940cde339  qwen36-mtp-draft/dense.txt
-b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91  qwen36-mtp-draft/draft_vocab.bin
-9126741d7e98f0e470cd04bf7ce3c91a89c08c116af02aa2d8d666c4195fdb15  qwen36-mtp-draft/experts.bin
-1e5ad8c088196bc95b49534ce68db9c278635c8a68f7b605ef1776589dea29d7  qwen36-mtp-draft/mtp.json
-048604044d93d7dd4e4e1140deba8ccf681b5c7c11e330e9434a570af42bcfa2  qwen36-mtp-draft/native_experts.txt
-```
+Step 12 (harness `bench/correctness/`; record in history at 7551f138, `bench/unbiased/correctness/`; 2026-10-18) checked these builds against llama.cpp `3cf03257`: upstream's
+parity programs that cover the kernels in use (38 pass, `poly_expert_parity` fails its own bound on one UD-Q3_K_M expert),
+and teacher-forced per-step distributions on 16 sequences per model (within llama.cpp's own CPU-vs-GPU spread on every set
+and arm). Two upstream claims did not hold and are not repeated here: the draft block is not bitwise inert above 4-token
+windows, and `strata`'s output is not reproducible across starts unless the expert cache is pinned. Tickets USTRAT-1 to 5.
 
-(`dense.bin` is byte-identical between the two packs: the dense weights unsloth keeps unquantized are the same in
-both files. The tokenizer directory's files are listed in `qwen36-*/index.txt`.)
+One test-only hunk since (2026-10-19, correctness checks of DeepSeek V4 Flash and GLM 5.3 Flash): `src/poly/main.cpp`
+`--tokens`, `--eos-ids` and `--follow` accept `@FILE` (the comma-separated ids read from that file), because a 31K-id
+list is over Linux's 128 KiB single-argument limit. `tools/qwen35/q36_llama_dump.cpp` (upstream's llama.cpp-side parity
+program, not part of the build) takes the same `@FILE` for `--tokens` and `--force`. Nothing on the serve path changes.
+
+## Removed
+
+Each entry names the rule above that it satisfies.
+
+- **Rule 1, installers and downloaders:** `setup.py` (8,223 lines: hardware detection, pip, CUDA, llama.cpp zips,
+  prebuilt engines from GitHub releases, model files from Hugging Face or ModelScope, pack and MTP orchestration,
+  run-config JSON, start), `setup.sh`, `SETUP.bat`, `START-HERE.bat`, `UPDATE.bat`, `update.sh`, `Dockerfile`,
+  `docker-entrypoint.sh`, `.dockerignore`, `flake.nix`, `flake.lock`, `requirements.txt` (replaced by
+  `tools/requirements.txt`: numpy and regex, for the offline tools only), `conftest.py` (pytest root for
+  `setup.py`'s tests), `tools/strata_mcp.py` (an installer driven over MCP), `tools/image/` (stable-diffusion.cpp,
+  Vulkan SDK and model downloads), `tools/hip/package_windows.py` (AMD nightly wheels), and their tests
+  (`tools/test_setup_*.py` with two golden JSONs, `test_strata_mcp.py`, `test_qimage.py`,
+  `test_docker_entrypoint.py`, `test_poly_prebuilt.py`). The jobs of `setup.py` that were not downloads (choosing
+  engine flags per card, RAM and context) become documented flags in `README.md`.
+- **Rule 2, Python in the serving path:** `serve/` (92 files, 33.9k lines: the HTTP server with the OpenAI,
+  Anthropic and Responses dialects, the jinja2 chat templating, the Python tokenizer path, the per-family
+  reasoning and tool-call parsers, MCP, structured output, replicas, Prometheus, the hardware monitor, the web
+  UI and 58 test files) and `polystrata.py` (the terminal front end, which imports `serve/`). Replaced by the C++
+  front end in `frontend/`, built from the pinned llama.cpp's `common`, `mtmd`, `cpp-httplib` and the
+  engine-agnostic files of `tools/server`. The engines' stdin/stdout protocol is unchanged.
+- **Rule 4, marketing:** the six translated READMEs (383 KB), `docs/media/` (12 MB: a 9.6 MB demo video still,
+  a 1.8 MB GIF, the figure SVGs and their generator), `.github/` (issue and PR templates), `SECURITY.md` (the
+  upstream project's advisory process) and `AGENTS.md` (contributor notes for upstream's tests and installers).
+  `README.md` is rewritten for this fork (PLAN.md step 10); the fork's model-file record is `docs/MODEL-FILES.md`,
+  its measurements are the "Measured" section of `README.md` (records in history at 7551f138).
+- **Documents only removed components (decided 2026-10-17):** `docs/INSTALL.md`, `AI_SETUP.md`, `MCP_SERVER.md`,
+  `IMAGES.md`, `LLAMA_SWAP.md`, `COMMUNITY_BENCHMARKS.md`, `FAQ.md`; `chat.py` (a terminal client) and
+  `tools/calibrate.py` (imports `setup` and `serve.server`), with their tests.
+- **Scripts that imported removed modules (decided 2026-10-17):** the engine gate scripts that drove the engine
+  through the Python server's `StrataEngine` class (`tools/batch_groups_cache_test.py`, `cancel_park_test.py`,
+  `conversation_cache_*.py`, `conversation_restore_speed.py`, `logit_bias_english_example.py`,
+  `logit_bias_http_probe.py`, `session_pressure_test.py`), `tools/strata_bench.py` with `bench.sh` and `BENCH.bat`
+  (one helper from `setup`), `tools/make_poly_release.py`, and the tests that imported `setup` or `serve`
+  (`test_mtp_fetch.py`, `test_shards.py`, `test_strata_tokenizer.py`, `test_effort_end_args.py`,
+  `test_research_run.py`, `test_benchmark_prompt.py`, `test_dll_closure.py`, `test_windows_amd_gpu.py`, the
+  `test_conversation_cache_*` and `test_strata_bench.py`). Upstream's copies run against upstream.
+- **Per-machine results and logs (decided 2026-10-19):** upstream's `bench/results/` (23 MB, one directory per
+  community machine) and the fork's own `bench/unbiased/` run directories (57 MB). A result from one machine is a
+  record, not source; the numbers that matter are in `README.md` "Measured", and the directories are in history at
+  7551f138. `bench/` keeps what is reusable: `bench_vs_llama.py` with `profile_corpus.json`, the kernel probes, and
+  `bench/correctness/` (the step-12 harness, moved from `bench/unbiased/correctness/scripts/`).

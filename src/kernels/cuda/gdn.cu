@@ -129,11 +129,10 @@ __global__ void gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
     for (int i = threadIdx.x; i < cols; i += blockDim.x) p[i] *= inv;
 }
 
-/// y = rms_norm(o, eps) * ssm_norm * act(z), one warp per head, norm over that head's S values.  `silu` 0 is
-/// sigmoid(z) (Flash-Next), 1 is SiLU(z) = z * sigmoid(z) (Qwen3.6, ggml's `op_silu`: x / (1 + exp(-x))).
+/// y = rms_norm(o, eps) * ssm_norm * sigmoid(z), one warp per head, norm over that head's S values.
 __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __restrict__ z,
                                     const float* __restrict__ ssm_norm, float* __restrict__ y, int S,
-                                    float eps, int silu) {
+                                    float eps) {
     const int h = blockIdx.x;
     const float* po = o + (size_t) h * S;
     const float* pz = z + (size_t) h * S;
@@ -145,11 +144,8 @@ __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __
     if (threadIdx.x == 0) ssum = acc;
     __syncthreads();
     const float inv = (float) (1.0 / sqrt(ssum / (double) S + (double) eps));
-    for (int i = threadIdx.x; i < S; i += blockDim.x) {
-        const float zz = pz[i];
-        const float act = silu ? zz / (1.0f + expf(-zz)) : sigmoid_f(zz);
-        py[i] = po[i] * inv * ssm_norm[i] * act;
-    }
+    for (int i = threadIdx.x; i < S; i += blockDim.x)
+        py[i] = po[i] * inv * ssm_norm[i] * sigmoid_f(pz[i]);
 }
 
 }  // namespace
@@ -237,10 +233,9 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {
 }
 
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
-                  float eps, GdnGate act, void* stream) {
+                  float eps, void* stream) {
     if (h_v <= 0 || S <= 0) return;
-    gdn_out_norm_kernel<<<(unsigned) h_v, 32, 0, (cudaStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps,
-                                                                         act == GdnGate::Silu ? 1 : 0);
+    gdn_out_norm_kernel<<<(unsigned) h_v, 32, 0, (cudaStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps);
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {

@@ -38,10 +38,7 @@ namespace {
 namespace mmq = strata::prefill::mmq;
 namespace fused = strata::prefill::fused;
 
-// the geometry under test: Flash-Next's 2560 / 640 top-10, then Qwen3.6's 2048 / 512 top-8 (the reference part runs
-// both; the timings keep the pack they were measured on)
-int N = 2560, FF = 640, K = 10;
-constexpr int GROUP = 16;
+constexpr int N = 2560, FF = 640, K = 10, GROUP = 16;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -60,6 +57,8 @@ struct Pair {
     ggml_type gu, d;
     const char* name;
 };
+// MMQ covers this pair (the HIP build has no Q4_K / Q5_K / Q5_1 MMQ: those pairs are checked against the reference only)
+bool mmq_ok(const Pair& p) { return mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
 
 struct Geo {
     size_t gu_row, d_row, up_off, down_off, bytes;
@@ -73,23 +72,34 @@ struct Geo {
     fused::NativeGeom native(const Pair& p) const {
         fused::NativeGeom g;
         g.gu_type = (int) p.gu; g.d_type = (int) p.d; g.gu_row = gu_row; g.d_row = d_row; g.up_off = up_off;
-        g.down_off = down_off; g.n_embd = N; g.n_ff = FF;
+        g.down_off = down_off;
         return g;
     }
 };
 
 // random blocks with a sane fp16 scale `d` at each block's start (every format here begins with it): scales chosen so
+// STRATA_PF_F16=1: the covered formats run on F16 weights (moe_f16_kq.cu, native_f16_kernel), not the int8 kernels
+bool f16_on() {
+    const char* v = std::getenv("STRATA_PF_F16");
+    return v != nullptr && v[0] == '1';
+}
+
 // that the weights' typical size is that of a 2-3 bit expert (a few hundredths)
 void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt19937& rng) {
     const size_t bs = ggml_type_size(t), nb = (size_t) rows * (size_t) (cols / ggml_blck_size(t));
     std::uniform_int_distribution<int> byte(0, 255);
-    const float lo = t == GGML_TYPE_IQ3_S ? 0.0004f : t == GGML_TYPE_IQ4_XS ? 0.00005f
+    const float lo = t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ? 0.00004f : t == GGML_TYPE_Q5_1 ? 0.0006f
+                   : t == GGML_TYPE_Q8_0 ? 0.0001f : t == GGML_TYPE_IQ3_S ? 0.0004f : t == GGML_TYPE_IQ4_XS ? 0.00005f
                    : t == GGML_TYPE_IQ4_NL ? 0.0002f : t == GGML_TYPE_Q2_0 ? 0.004f : 0.0008f;
     std::uniform_real_distribution<float> sc(lo, 6.0f * lo);
     for (size_t i = 0; i < nb * bs; ++i) m[i] = (uint8_t) byte(rng);
     for (size_t b = 0; b < nb; ++b) {
         const ggml_fp16_t h = ggml_fp32_to_fp16(sc(rng));
         std::memcpy(m + b * bs, &h, 2);
+        if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1) {   // the minimum's scale, either sign
+            const ggml_fp16_t h2 = ggml_fp32_to_fp16(sc(rng) * ((rng() & 1) ? 1.0f : -1.0f) * (t == GGML_TYPE_Q5_1 ? 4.0f : 1.0f));
+            std::memcpy(m + b * bs + 2, &h2, 2);
+        }
     }
 }
 std::vector<uint8_t> make_blob(const Pair& p, const Geo& g, std::mt19937& rng) {
@@ -163,9 +173,9 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
     MmqBufs(const Pair& p, int64_t rows, int E)
-        : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 2 * FF * 4), h((size_t) rows * FF * 4),
+        : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 1280 * 4), h((size_t) rows * FF * 4),
           hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident((size_t) rows * 4),
-          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, 2 * FF, N) + 4096),
+          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, 1280, N) + 4096),
           grp_d(GROUP * mmq::matrix_bytes(p.d, N, FF) + 4096) {}
 };
 // `direct`: no gathers - the products read the blobs where they are (they must lie at a fixed stride, every expert
@@ -173,7 +183,7 @@ struct MmqBufs {
 void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const Routing& r, const float* x_dev,
              const int32_t* src_dev, const std::vector<const uint8_t*>& blob, int64_t rows, cudaStream_t s,
              bool direct = false, size_t stride = 0) {
-    const size_t gub = mmq::matrix_bytes(p.gu, 2 * FF, N), db = mmq::matrix_bytes(p.d, N, FF);
+    const size_t gub = mmq::matrix_bytes(p.gu, 1280, N), db = mmq::matrix_bytes(p.d, N, FF);
     const int E = (int) r.cnt.size();
     std::vector<int32_t> order;
     for (int e = 0; e < E; ++e) if (r.cnt[(size_t) e] > 0) order.push_back(e);
@@ -205,12 +215,12 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         }
         const uint8_t* b0 = blob[(size_t) order[j0]];
         mmq::Product gu;
-        gu.w = direct ? (const void*) b0 : b.grp_gu.p; gu.type = (int) p.gu; gu.w_rows = 2 * FF; gu.w_cols = N;
+        gu.w = direct ? (const void*) b0 : b.grp_gu.p; gu.type = (int) p.gu; gu.w_rows = 1280; gu.w_cols = N;
         gu.expert_bytes = direct ? stride : gub;
         gu.n = ngx; gu.xq = b.xq.p; gu.bounds = b.bounds.as<int32_t>() + j0; gu.ids = b.ident.as<int32_t>();
-        gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 2 * FF;
+        gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 1280;
         ctx.run(gu, s);
-        mmq::swiglu(b.gu.as<float>() + r0 * 2 * FF, b.h.as<float>() + r0 * FF, nr, FF, false, s);
+        mmq::swiglu(b.gu.as<float>() + r0 * 1280, b.h.as<float>() + r0 * FF, nr, FF, false, s);
         mmq::quantize(b.h.as<float>() + r0 * FF, nullptr, b.hq.p, (int) p.d, FF, FF, nr, s);
         mmq::Product dn;
         dn.w = direct ? (const void*) (b0 + geo.down_off) : b.grp_d.p; dn.type = (int) p.d; dn.w_rows = N; dn.w_cols = FF;
@@ -274,6 +284,16 @@ Err compare(const std::vector<float>& a, RA row_a, const std::vector<float>& b, 
     return out;
 }
 
+// the kernels' int8 rounding per 32 values (quant_act_nat_kernel / the H epilogue), as floats: codes * (amax / 127)
+void quant32(const float* in, float* out, int n) {
+    for (int b = 0; b < n; b += 32) {
+        float am = 0.0f;
+        for (int j = 0; j < 32; ++j) am = std::max(am, std::fabs(in[b + j]));
+        const float inv = am > 0.0f ? 127.0f / am : 0.0f, d = am / 127.0f;
+        for (int j = 0; j < 32; ++j) out[b + j] = (float) std::nearbyint(in[b + j] * inv) * d;
+    }
+}
+
 std::vector<float> download(const Dev& d, size_t n) {
     std::vector<float> h(n);
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
@@ -313,27 +333,30 @@ void reference_part(const Pair& p, cudaStream_t s) {
     // (the uploads above are on the legacy stream and the work below on a non-blocking one: a cudaMemcpy from pageable
     // memory may return before its DMA lands - on Windows it can wait in the queue until the next synchronous call)
     ck(cudaDeviceSynchronize(), "uploads");
+    const bool mq = mmq_ok(p);
     mmq::Context ctx;
-    MmqBufs mb(p, rows, E);
-    run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
+    MmqBufs* mbp = mq ? new MmqBufs(p, rows, E) : nullptr;
+    if (mq) run_mmq(p, geo, ctx, *mbp, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
     FusedBufs fb(T, rows, E);
     ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
     ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");   // an unwritten row is NaN
     ck(cudaDeviceSynchronize(), "uploads");
     run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, 20, E}, blob, s);
     ck(cudaStreamSynchronize(s), "sync");
-    const std::vector<float> y_mmq = download(mb.dm, (size_t) rows * N), y_f = download(fb.dm, (size_t) rows * N);
+    const std::vector<float> y_mmq = mq ? download(mbp->dm, (size_t) rows * N) : std::vector<float>((size_t) rows * N, 0.0f),
+                             y_f = download(fb.dm, (size_t) rows * N);
+    delete mbp;
     const std::vector<int32_t> slot = download_i(fb.slot, (size_t) rows), fsrc = download_i(fb.src, (size_t) rows);
     for (int64_t i = 0; i < rows; ++i)
         if (fsrc[(size_t) slot[(size_t) i]] != (int32_t) (i / K)) throw std::runtime_error("group: slot/src disagree");
 
     // the reference, an expert at a time on all cores
-    std::vector<float> ref((size_t) rows * N);
+    std::vector<float> ref((size_t) rows * N), ref2((size_t) rows * N);   // ref2: the same with the kernels' int8 rounding
     std::vector<std::thread> th;
     const int nth = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
     for (int w = 0; w < nth; ++w)
         th.emplace_back([&, w] {
-            std::vector<float> gu, dn, h(FF);
+            std::vector<float> gu, dn, h(FF), h2(FF), hq(FF), xq(N);
             for (int e = w; e < E; e += nth) {
                 if (r.cnt[(size_t) e] == 0) continue;
                 dequant(p, geo, host[(size_t) e], gu, dn);
@@ -352,6 +375,20 @@ void reference_part(const Pair& p, cudaStream_t s) {
                         for (int f = 0; f < FF; ++f) a += (double) wd[f] * h[(size_t) f];
                         ref[(size_t) i * N + o] = (float) a;
                     }
+                    quant32(xr, xq.data(), N);
+                    for (int f = 0; f < FF; ++f) {
+                        double gt = 0, up = 0;
+                        const float *wg = gu.data() + (size_t) f * N, *wu = gu.data() + (size_t) (FF + f) * N;
+                        for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xq[(size_t) k]; up += (double) wu[k] * xq[(size_t) k]; }
+                        h2[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
+                    }
+                    quant32(h2.data(), hq.data(), FF);
+                    for (int o = 0; o < N; ++o) {
+                        double a = 0;
+                        const float* wd = dn.data() + (size_t) o * FF;
+                        for (int f = 0; f < FF; ++f) a += (double) wd[f] * hq[(size_t) f];
+                        ref2[(size_t) i * N + o] = (float) a;
+                    }
                 }
             }
         });
@@ -360,24 +397,36 @@ void reference_part(const Pair& p, cudaStream_t s) {
     auto pair = [](size_t i) { return (int64_t) i; };
     auto mrow = [&](size_t i) { return (int64_t) r.row_of[i]; };
     auto frow = [&](size_t i) { return (int64_t) slot[i]; };
-    const Err em = compare(y_mmq, mrow, ref, pair, (size_t) rows);
+    const Err em = mq ? compare(y_mmq, mrow, ref, pair, (size_t) rows) : Err{};
     const Err ef = compare(y_f, frow, ref, pair, (size_t) rows);
-    const Err efm = compare(y_f, frow, y_mmq, mrow, (size_t) rows);
-    std::printf("  MMQ   vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", em.rms, em.worst);
+    const Err efm = mq ? compare(y_f, frow, y_mmq, mrow, (size_t) rows) : Err{};
+    const Err e2 = compare(y_f, frow, ref2, pair, (size_t) rows);
+    std::printf("  fused vs the int8-rounded model (same activation / H rounding, double sums): rel RMS %.3e  worst %.3e\n",
+                e2.rms, e2.worst);
+    // STRATA_PF_F16=1: H's int8 rounding meets values a few F16 ulps from the int8 model's (f16_on); the FP32 reference
+    // checks below stay as they are
+    if (e2.rms > (f16_on() ? 5e-3 : 2e-3) || e2.worst > 3e-2)
+        throw std::runtime_error(std::string(p.name) + ": the fused path differs from its own arithmetic's model");
+    if (mq) std::printf("  MMQ   vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", em.rms, em.worst);
     std::printf("  fused vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", ef.rms, ef.worst);
-    std::printf("  fused vs MMQ           : rel RMS %.3e  worst row max rel %.3e\n", efm.rms, efm.worst);
+    if (mq) std::printf("  fused vs MMQ           : rel RMS %.3e  worst row max rel %.3e\n", efm.rms, efm.worst);
     double zmax = 0;
     for (int k = 0; k < K; ++k)
         for (int o = 0; o < N; ++o)
             zmax = std::max(zmax, (double) std::fabs(y_f[(size_t) slot[(size_t) (ZERO * K + k)] * N + o]));
     if (zmax != 0) throw std::runtime_error(std::string(p.name) + ": the all-zero token's outputs are not zero");
+    if (!mq) {   // no MMQ here: the int8 activations' own error (the IQ pairs' fused path sits at ~1e-2 rel RMS)
+        if (ef.rms > 0.03 || ef.worst > 0.25)
+            throw std::runtime_error(std::string(p.name) + ": the fused path's error against the reference is too large");
+        return;
+    }
     if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
         throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's");
 }
 
 // part 2: one layer at a real chunk, timed
 void timing_part(const Pair& p, int T, cudaStream_t s) {
-    constexpr int E = 512;
+    static const int E = [] { const char* v = std::getenv("S20_E"); return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : 512; }();   // S20_E=256: the Coder pack
     const Geo geo(p);
     std::mt19937 rng(1360);
     const int64_t rows = (int64_t) T * K;
@@ -404,8 +453,10 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
     ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
     ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
+    const bool mq = mmq_ok(p);
     mmq::Context ctx;
-    MmqBufs mb(p, rows, E);
+    MmqBufs* mbp = mq ? new MmqBufs(p, rows, E) : nullptr;
+    MmqBufs& mb = *mbp;   // (only used when mq)
     FusedBufs fb(T, rows, E);
     ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
     ck(cudaDeviceSynchronize(), "uploads");   // (see reference_part)
@@ -423,7 +474,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     };
     auto mmq_run = [&] { run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s); };
     auto fused_run = [&] { run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, E}, blob, s); };
-    const bool all_routed = std::count(r.cnt.begin(), r.cnt.end(), 0) == 0;
+    const bool all_routed = mq && std::count(r.cnt.begin(), r.cnt.end(), 0) == 0;
     auto direct_run = [&] {
         run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s, true, stride);
     };
@@ -449,7 +500,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         }
     }
     // ~1 s of both first (the clocks ramp up), then alternating rounds; the medians
-    const bool no_mmq = std::getenv("S20_NOMMQ") != nullptr;   // (debug: the fused runs alone)
+    const bool no_mmq = !mq || std::getenv("S20_NOMMQ") != nullptr;   // (debug: the fused runs alone)
     for (float spent = 0; spent < 1000.0f;) spent += (no_mmq ? 0.0f : once(mmq_run)) + once(fused_run);
     std::vector<float> tm, tf, td;
     for (int rep = 0; rep < 8; ++rep) {
@@ -470,10 +521,17 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     std::sort(tf2.begin(), tf2.end());
     std::printf("  (fused back to back: median %.3f ms, min %.3f; alternating min %.3f; MMQ min %.3f)\n", tf2[4],
                 tf2[0], tf[0], tm[0]);
-    const std::vector<float> y_mmq = download(mb.dm, (size_t) rows * N), y_f = download(fb.dm, (size_t) rows * N);
+    const std::vector<float> y_mmq = mq ? download(mb.dm, (size_t) rows * N) : std::vector<float>((size_t) rows * N, 0.0f),
+                             y_f = download(fb.dm, (size_t) rows * N);
     const std::vector<int32_t> slot = download_i(fb.slot, (size_t) rows);
-    const Err efm = compare(y_f, [&](size_t i) { return (int64_t) slot[i]; }, y_mmq,
-                            [&](size_t i) { return (int64_t) r.row_of[i]; }, (size_t) rows);
+    {   // (Aurora S23) a hash of the fused output's bits, to compare two builds bit for bit
+        uint64_t hsh = 1469598103934665603ull;
+        for (size_t i = 0; i < (size_t) rows; ++i)   // in pair order: the rows of an expert are placed in any order
+            for (size_t c = 0; c < (size_t) N; ++c) { uint32_t u; std::memcpy(&u, &y_f[(size_t) slot[i] * N + c], 4); hsh = (hsh ^ u) * 1099511628211ull; }
+        std::printf("  fused output bits hash %016llx\n", (unsigned long long) hsh);
+    }
+    const Err efm = mq ? compare(y_f, [&](size_t i) { return (int64_t) slot[i]; }, y_mmq,
+                                 [&](size_t i) { return (int64_t) r.row_of[i]; }, (size_t) rows) : Err{};
     std::printf("%s - timing part: %d tokens x top %d over %d experts, one layer: MMQ path %.3f ms, fused %.3f ms "
                 "(%.2fx); fused vs MMQ rel RMS %.3e worst row %.3e\n",
                 p.name, T, K, E, t_mmq, t_f, t_mmq / t_f, efm.rms, efm.worst);
@@ -563,19 +621,23 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                 for (int f = 0; f < FF; ++f) a += (double) wd[f] * h[(size_t) f];
                 ref[j * N + o] = (float) a;
             }
-            std::copy_n(y_mmq.begin() + (ptrdiff_t) ((size_t) r.row_of[i] * N), N, ym.begin() + (ptrdiff_t) (j * N));
+            if (mq) std::copy_n(y_mmq.begin() + (ptrdiff_t) ((size_t) r.row_of[i] * N), N, ym.begin() + (ptrdiff_t) (j * N));
             std::copy_n(y_f.begin() + (ptrdiff_t) ((size_t) slot[i] * N), N, yf.begin() + (ptrdiff_t) (j * N));
         }
         auto id = [](size_t j) { return (int64_t) j; };
-        const Err em = compare(ym, id, ref, id, pick.size()), ef = compare(yf, id, ref, id, pick.size());
+        const Err em = mq ? compare(ym, id, ref, id, pick.size()) : Err{}, ef = compare(yf, id, ref, id, pick.size());
         std::printf("  sample of %zu pairs vs FP32 reference: MMQ rel RMS %.3e worst %.3e, fused rel RMS %.3e worst "
                     "%.3e\n", pick.size(), em.rms, em.worst, ef.rms, ef.worst);
-        if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
+        if (!mq ? (ef.rms > 0.03 || ef.worst > 0.25) : (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst))
             throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's (timing)");
     }
     cudaEventDestroy(a);
     cudaEventDestroy(b);
-    if (efm.rms > 0.05) throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
+    delete mbp;
+    // the two int8 paths at the real shape, every tile of the layer: R9700 rel RMS 1.3-1.9e-4, worst row 2.9e-3-8.3e-3
+    // (STRATA_PF_F16=1: F16 products against MMQ's int8, gfx1151 rel RMS 2.5-2.7e-3, worst row 6.4e-3-8.8e-3)
+    if (mq && !no_mmq && (efm.rms > (f16_on() ? 5e-3 : 1e-3) || efm.worst > 2e-2))
+        throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
 }
 }  // namespace
 
@@ -585,15 +647,28 @@ int main(int argc, char** argv) {
         _putenv_s("STRATA_PF_FUSED", "1");
 #else
         setenv("STRATA_PF_FUSED", "1", 1);
+        setenv("STRATA_PF_FUSED_KQ", "1", 1);   // (the HIP build's Q4_K / Q5_K / Q5_1 / Q8_0 pairs)
 #endif
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
-        if (!fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
+        // gfx12: only the native kernels exist (fused::available() is the Q2_0 pack's), so they decide there
+        if (!fused::available() && !fused::native_supported(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL)) {
+            std::printf("the fused kernels need sm_80 or newer (or gfx11 / gfx12 matrix cores): skipped\n");
+            return 77;
+        }
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
         const std::vector<Pair> pairs = {
             {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
             {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, "IQ2_XS / IQ4_NL"}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},
-            {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"}};
+            {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"},
+            // (HIP only) UD-Q4_K_XL's: 47 layers Q4_K / Q5_1, 4 Q4_K / Q8_0, and the one Q5_K layer
+            {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},         {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
+            {GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, "Q5_K / Q5_1"},         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"},
+            // the Coder IQ1_M pack's other pairs (appended: the default timing set takes pairs 0, 1, 4, 3 by index)
+            {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"},   {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, "IQ3_XXS / Q2_0"},
+            {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"},
+            // the canonical Q2_0 pack (gate/up and down Q2_0; CUDA)
+            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -613,22 +688,24 @@ int main(int argc, char** argv) {
         }
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
-        struct Geom { int n, ff, k; const char* model; };
-        for (const Geom& gm : {Geom{2560, 640, 10, "Flash-Next"}, Geom{2048, 512, 8, "Qwen3.6"}}) {
-            N = gm.n; FF = gm.ff; K = gm.k;
-            std::printf("== %s geometry: n_embd %d, n_ff %d, top-%d\n", gm.model, N, FF, K);
-            for (const Pair& p : pairs) {
-                if (only && std::string(p.name).find(only) == std::string::npos) continue;
-                if (!fused::native_supported((int) p.gu, (int) p.d))
-                    throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
-                if (ref) reference_part(p, s);
+        for (const Pair& p : pairs) {
+            if (only ? std::string(p.name).find(only) == std::string::npos : p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K) continue;
+            if (!fused::native_supported((int) p.gu, (int) p.d)) {
+                // the canonical Q2_0 pack's Q2_0 gate/up is the Turing opt-in's (STRATA_PF_FUSED_SM75=1), and on Turing that is
+                // the only pair set up: skip what this device does not take (--only=NAME still insists)
+                const bool turing_pair = p.gu == GGML_TYPE_Q2_0 && p.d == GGML_TYPE_Q2_0;
+                int major = 0;
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+                if ((major < 8 || turing_pair) && !only) { std::printf("%s: not set up on this device (skipped)\n", p.name); continue; }
+                throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
             }
+            if (ref) reference_part(p, s);
         }
-        N = 2560; FF = 640; K = 10;
         if (timing) {
             // the IQ2_XS pack's layers (34 of 48 IQ2_S / Q2_0, 11 IQ2_XXS / Q2_0), the IQ3_S pack's most common, IQ3_XXS's
-            for (const Pair& p : {pairs[0], pairs[1], pairs[4], pairs[3]}) {
+            for (const Pair& p : only ? pairs : std::vector<Pair>{pairs[0], pairs[1], pairs[4], pairs[3]}) {
                 if (only && std::string(p.name).find(only) == std::string::npos) continue;
+                if (!fused::native_supported((int) p.gu, (int) p.d)) continue;   // (Turing: the Q2_0 pair only)
                 for (int T : chunks) timing_part(p, T, s);
             }
         }

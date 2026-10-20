@@ -1,5 +1,4 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
-#include "strata/core/qsa_shapes.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
@@ -9,6 +8,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/ngram.hpp"
 
 #include <cuda_runtime.h>
@@ -48,9 +48,8 @@ uint64_t gdn_state_floats(const ModelGeometry& g) {
 
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
 /// session arena.  The table and the weights are model-level and the caller owns them.
-static uint64_t ple_hist_bytes(const ModelGeometry& g) {
-    // a model without a PLE (Qwen3.6, `has_ple` false) carves none of it (Qwen3.6 port, step 2; inventory row 29)
-    return g.has_ple ? (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float) : 0;
+static uint64_t ple_hist_bytes() {
+    return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
@@ -70,7 +69,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
-    n += ple_hist_bytes(g);                      // the PLE's NG_HIST normalized history rows (0 without a PLE)
+    n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
@@ -125,7 +124,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     block_buffers_init(g, s.block_arena, s.block);
     // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
     // `session_zero`; it survives every token, which is the whole point of a conv history.
-    s.ple_hist = ple_hist_bytes(g) ? (float*) take(ple_hist_bytes(g)) : nullptr;
+    s.ple_hist = (float*) take(ple_hist_bytes());
     s.R = s.block.R;
     return used;
 }
@@ -138,7 +137,24 @@ void session_release(SessionState& s) {
         }
 }
 
+#if defined(STRATA_GPU_METAL)
+}  // namespace strata::core
+namespace strata::metal_engine {
+void window_reset();   // metal/src/engine/window.cpp: the decode window's running state back to a new sequence's
+}  // namespace strata::metal_engine
+namespace strata::core {
+#endif
+
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
+#if defined(STRATA_GPU_METAL)
+    // the running state lives in the Metal decode window; the session's own device buffers are not read there
+    (void) g; (void) R_init; (void) stream;
+    strata::metal_engine::window_reset();
+    s.ple_prev[0] = -1;
+    s.ple_prev[1] = -1;
+    s.ple_token = -1;
+    return;
+#endif
     cudaStream_t cs = (cudaStream_t) stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
@@ -158,7 +174,7 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
     // for the same reason: `ngram_rows` treats a missing predecessor as the EOS cut, which is what a sequence
     // boundary IS.
-    if (s.ple_hist != nullptr) cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(g), cs);
+    cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs);
     s.ple_prev[0] = -1;
     s.ple_prev[1] = -1;
     s.ple_token = -1;
@@ -177,7 +193,7 @@ void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
 /// captured the SOURCE POINTER, not the value, and that is exactly why the buffers are pinned and fixed.
 void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s) {
-    const strata::kernels::QsaShapes sh = qsa_shapes(g);   // the one builder (qsa_shapes.hpp): dense width = n_kv
+    const strata::kernels::QsaShapes sh = qsa_shapes(g);
     for (int64_t j = 0; j < s.qsa_alloc; ++j) {
         QsaState& q = s.qsa_states[s.qsa_ord0 + j];
         qsa_step_fill(q.host_step, pos, sh);
@@ -541,11 +557,20 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     // core or its SMT sibling.  The symptom is not an error: it is a CPU path at 26.9 GB/s where the same pool
     // runs at 36.32.  It was being done and undone on EVERY token, which is a syscall pair on the critical path
     // for a property that wants to hold for the whole session.
-    const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
-    if (!cores.empty()) {
-        pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
+    // The host's core is the pool's reserved one: the first physical core, or the last with --host-core last (F12),
+    // or the first core's SMT sibling with --host-core sibling.
+    const int host_core = strata::kernels::cpu::planned_host_core();
+    if (host_core >= 0) {
+        pinned_core = strata::kernels::cpu::pin_current_thread(host_core);
         pinned = pinned_core.valid;
+    } else {
+        const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+        if (!cores.empty()) {
+            pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
+            pinned = pinned_core.valid;
+        }
     }
+    strata::aux_cpus::note_owned_thread();   // the host: --aux-cpus leaves it where it is
     return true;
 }
 

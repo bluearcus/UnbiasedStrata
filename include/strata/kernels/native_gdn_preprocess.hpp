@@ -1,6 +1,4 @@
 #pragma once
-#include "strata/kernels/gdn.hpp"
-
 #include <cstdint>
 
 namespace strata::kernels {
@@ -30,11 +28,10 @@ void native_gdn_beta_gate(float* beta, int64_t heads, void* stream);
 void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
                      float* gate, int64_t heads, void* stream);
 
-// [heads,128]: rms_norm(output,epsilon)*gamma*act(z), act sigmoid (qwen4exp) or
-// SiLU (qwen35moe) per `GdnGate`. Gamma contains only 128 floats and broadcasts
-// across heads. Destination is disjoint from inputs.
+// [heads,128]: rms_norm(output,epsilon)*gamma*sigmoid(z). Gamma contains only
+// 128 floats and broadcasts across heads. Destination is disjoint from inputs.
 void native_gdn_out_norm(const float* output, const float* z, const float* gamma,
                          float* destination, int64_t heads, int64_t cols,
-                         float epsilon, GdnGate act, void* stream);
+                         float epsilon, void* stream);
 
 } // namespace strata::kernels
