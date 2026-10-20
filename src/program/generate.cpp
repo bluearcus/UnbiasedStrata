@@ -33,6 +33,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/vram_cap.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -152,11 +153,34 @@ bool under_wddm() {
 #endif
 }
 
+// --vram-cap N | D:MIB,... (PLAN-dual-gpu.md Phase 3, re-applied on 0.1.45): per-card VRAM caps.  A single N caps
+// every card; D:MIB pairs cap one ordinal each (the 3090 + 4070: 0:22000,1:10000).  Every free figure the planners
+// read goes through vram_info() below, and a blocker of (total - cap) is held on each capped card, so a card is
+// sized as the smaller card would be.  Upstream 0.1.40 removed both the option and this wrapper; with no cap the
+// wrapper forwards unchanged.
+std::map<int, int64_t> g_vram_cap_mibs;          // CUDA ordinal (or -1 = every card) -> MiB
+std::map<int, uint64_t> g_vram_blocker_bytes;    // CUDA ordinal -> the blocker's own bytes (never double-counted)
+std::vector<void*> g_vram_blockers;              // kept alive for the engine's lifetime
+cudaError_t vram_info(size_t* free_b, size_t* total_b) {
+    const cudaError_t e = cudaMemGetInfo(free_b, total_b);    if (e == cudaSuccess && !g_vram_cap_mibs.empty() && *total_b > 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+        const int64_t cap_mib = strata::core::vram_cap_mib_for(g_vram_cap_mibs, dev);
+        if (cap_mib > 0) {
+            auto it = g_vram_blocker_bytes.find(dev);
+            const uint64_t blocker = it != g_vram_blocker_bytes.end() ? it->second : 0;
+            const uint64_t all = *total_b > *free_b ? *total_b - *free_b : 0;
+            *free_b = (size_t) strata::core::vram_capped_free(*free_b, all, (uint64_t) cap_mib, blocker);
+        }
+    }
+    return e;
+}
+
 // #620 #486: " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
 std::string vram_free_note() {
     (void) cudaGetLastError();
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+    if (vram_info(&free_b, &total_b) != cudaSuccess) {
         (void) cudaGetLastError();
         return {};
     }
@@ -596,7 +620,9 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
-    bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
+    bool vram_reserve_given = false;
+    /// --vram-cap N | D:MIB,... : per-device VRAM caps (see vram_info above).  Empty = no cap.
+    std::string vram_cap;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
     /// #533 (opt-in): the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
@@ -882,6 +908,9 @@ void usage() {
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                 "  --vram-cap N|D:MIB,...  emulate smaller cards: one cap for every card, or one per CUDA\n"
+                 "                       ordinal (the 3090 + 4070: 0:22000,1:10000).  Each card plans from its\n"
+                 "                       own capped free figure and a blocker holds the rest back\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -1455,7 +1484,7 @@ void mem_mark(const char* where) {
     static const char* const env = std::getenv("STRATA_TRACE");
     if (env == nullptr) return;
     size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
+    vram_info(&free_b, &total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
     // STRATA_TRACE=2: also wait for the device here and name the first step after which it reports an error.  A
     // "sticky" failure (#2013: unspecified launch failure surfacing in a later, unrelated call) is then pinned to
@@ -2424,6 +2453,15 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
+        else if (a == "--vram-cap") {
+            const std::string vc = next("--vram-cap");
+            std::string perr;
+            if (!strata::core::parse_vram_cap(vc, g_vram_cap_mibs, perr)) {
+                std::fprintf(stderr, "strata generate: %s\n", perr.c_str());
+                return 2;
+            }
+            o.vram_cap = vc;
+        }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
         else if (a == "--prefill") {
@@ -2702,6 +2740,61 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    // --vram-cap: a blocker of (total - cap) on each capped card, allocated before the weight arena, so every later
+    // free figure (and the driver's own pressure) is the smaller card's.  vram_info() clamps from here on.
+    if (!o.vram_cap.empty()) {
+        int ndev = 0;
+        if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) {
+            std::fprintf(stderr, "strata generate: --vram-cap: no CUDA device is visible\n");
+            return 1;
+        }
+        int cur = 0;
+        (void) cudaGetDevice(&cur);
+        for (int dev = 0; dev < ndev; ++dev) {
+            const int64_t cap_mib = strata::core::vram_cap_mib_for(g_vram_cap_mibs, dev);
+            if (cap_mib <= 0) continue;
+            if (cudaSetDevice(dev) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: --vram-cap: cannot select CUDA device %d\n", dev);
+                (void) cudaSetDevice(cur);
+                return 1;
+            }
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: --vram-cap: cudaMemGetInfo failed: %s\n",
+                             cudaGetErrorString(cudaGetLastError()));
+                (void) cudaSetDevice(cur);
+                return 1;
+            }
+            const uint64_t cap = (uint64_t) cap_mib << 20;
+            const uint64_t used = total_b > free_b ? total_b - free_b : 0;
+            if (cap >= total_b) {
+                std::fprintf(stderr, "strata generate: --vram-cap %lld MiB is not below card %d's %llu MiB: no cap there\n",
+                             (long long) cap_mib, dev, (unsigned long long) (total_b >> 20));
+                continue;
+            }
+            void* blocker = nullptr;
+            const uint64_t hold = total_b - cap;
+            if (hold > free_b || cudaMalloc(&blocker, (size_t) hold) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata generate: --vram-cap %lld MiB: cannot hold back %llu MiB of card %d's %llu "
+                                     "(%llu MiB free, %llu used by other programs)\n", (long long) cap_mib,
+                             (unsigned long long) (hold >> 20), dev, (unsigned long long) (total_b >> 20),
+                             (unsigned long long) (free_b >> 20), (unsigned long long) (used >> 20));
+                (void) cudaSetDevice(cur);
+                return 1;
+            }
+            g_vram_blocker_bytes[dev] = hold;
+            g_vram_blockers.push_back(blocker);
+            size_t f2 = 0, t2 = 0;
+            vram_info(&f2, &t2);
+            std::fprintf(stderr, "strata generate: --vram-cap %lld MiB on card %d: %llu MiB of this %llu MiB card held back; "
+                                 "%llu MiB free to this engine\n",
+                         (long long) cap_mib, dev, (unsigned long long) (hold >> 20),
+                         (unsigned long long) (total_b >> 20), (unsigned long long) (f2 >> 20));
+        }
+        (void) cudaSetDevice(cur);
+    }
+
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
         if (mib < 0) {
@@ -3624,7 +3717,7 @@ int main(int argc, char** argv) {
         }
 #endif
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        vram_info(&free_b, &total_b);
         std::fprintf(stderr, "strata generate: cudaMalloc(%llu) for the weight arena failed (%s): %llu MiB of %llu "
                              "MiB VRAM free on this GPU. The arena is allocated first, before the KV and expert "
                              "caches: another program (or an engine that is still exiting) holds the rest - "
@@ -3955,7 +4048,7 @@ int main(int argc, char** argv) {
                 pairs_bytes += native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard)
                                            : (int64_t) lay.max_blob;
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            vram_info(&fb, &tb);
             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
             const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
             const int64_t room = (int64_t) fb - held_back;
@@ -4072,7 +4165,7 @@ int main(int argc, char** argv) {
             !st.wt.load(o.pack, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // #486: what that card had free
-            cudaMemGetInfo(&free_b, &total_b);
+            vram_info(&free_b, &total_b);
             std::fprintf(stderr, "strata generate: layer split, CUDA%d weights: %s (%llu MiB needed, %llu MiB of %llu "
                                  "MiB free on that card)\n", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str(),
@@ -4142,7 +4235,7 @@ int main(int argc, char** argv) {
         }
         if (!late_weights) {
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            vram_info(&fb, &tb);
             std::fprintf(stderr, "strata generate: layer split: CUDA%d holds its weights; %.2f GiB free (its session "
                                  "follows the split search)\n", st.dev, (double) fb / 1073741824.0);
         }
@@ -4308,7 +4401,7 @@ int main(int argc, char** argv) {
     auto stage_room = [&](int dev, bool later, bool drafter, bool search = false) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
-        if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
+        if (const cudaError_t e = vram_info(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
@@ -4916,10 +5009,10 @@ int main(int argc, char** argv) {
             GpuStage& st = *stages[i];
             const strata::core::OnDevice on(st.dev);
             size_t before = 0, total_b = 0;   // what this stage's load really costs, against what the search priced
-            cudaMemGetInfo(&before, &total_b);
+            vram_info(&before, &total_b);
             if (!load_stage_weights(st, st.lb, st.le, true)) return 1;
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            vram_info(&fb, &tb);
             {
                 // under-pricing is what put layers on a card that could not hold them (#1238); a little over-pricing is
                 // by design (a granule per matrix runs ~0.8% high).  Past 5% the pricing has drifted from the loading.
@@ -5011,7 +5104,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         size_t fb = 0, tb = 0;
-        cudaMemGetInfo(&fb, &tb);
+        vram_info(&fb, &tb);
         std::fprintf(stderr, "strata generate: layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
                              "%.2f GiB free\n", st.dev, (long long) st.lb, (long long) st.le,
                      last ? " and the head" : "", (double) fb / 1073741824.0);
@@ -5142,7 +5235,7 @@ int main(int argc, char** argv) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
-                    cudaMemGetInfo(&fb, &tb);
+                    vram_info(&fb, &tb);
                     std::fprintf(stderr, "strata generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
                                          "(%.2f GiB each, %.2f GiB free); %d slot%s\n", o.batch, b, dev,
                                  (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
@@ -5154,7 +5247,7 @@ int main(int argc, char** argv) {
             }
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            vram_info(&fb, &tb);
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
@@ -5226,7 +5319,7 @@ int main(int argc, char** argv) {
             }
             if (!slot_mtp.empty()) {
                 size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
+                vram_info(&fb, &tb);
                 std::fprintf(stderr, "strata generate: --batch-mtp: %d slot drafters on CUDA%d (%.0f MiB of private K/V "
                                      "state and buffers each, sharing the solo drafter's weights); %.2f GiB free there\n",
                              (int) slot_mtp.size(), mtp.device(), (double) slot_mtp.front()->vram_bytes() / 1048576.0,
@@ -5713,7 +5806,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
             size_t fb_now = 0, tb_now = 0;
             // #1709: a 16 GB card (RX 9070 XT, 7800 XT) reports 15.9 GiB, just under 16: the floor is for 15 GiB and up
-            if (cudaMemGetInfo(&fb_now, &tb_now) == cudaSuccess && tb_now >= (15ull << 30)) {
+            if (vram_info(&fb_now, &tb_now) == cudaSuccess && tb_now >= (15ull << 30)) {
                 std::fprintf(stderr, "strata generate: expert cache auto: Windows keeps %d MiB free after the cache on a card "
                                      "this size (the default %d MiB left 323 MiB on a 20 GB card and Windows paged, #1376); "
                                      "--vram-reserve-mib N sets it\n", kWddmAutoReserveMib, o.vram_reserve_mib);
@@ -6152,7 +6245,7 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            vram_info(&fb, &tb);
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
                          st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
         }
@@ -6239,7 +6332,7 @@ int main(int argc, char** argv) {
             const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
             const strata::core::OnDevice on(dev);
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            vram_info(&fb, &tb);
             const strata::core::ExpertCache& xc = i == 0 ? xcache : stages[(size_t) i - 1]->cache;
             const uint64_t cn = strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[(size_t) i - 1]->ss, c);
             const int64_t slots = xc.slots();
@@ -6363,8 +6456,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         const auto tp0 = Clock::now();
+        // the peer sizes itself from its own card's figures: its --vram-cap entry and blocker, when set
+        const int64_t peer_cap = strata::core::vram_cap_mib_for(g_vram_cap_mibs, o.peer_device);
+        auto bit = g_vram_blocker_bytes.find(o.peer_device);
+        const uint64_t peer_blocker = bit != g_vram_blocker_bytes.end() ? bit->second : 0;
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
-                       err)) {
+                       err, peer_cap, peer_blocker)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -6372,6 +6469,11 @@ int main(int argc, char** argv) {
                              "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        // the probe's verdict: decode needs no P2P (rows return through pinned host rows), the prompt helper does
+        std::fprintf(stderr, "strata generate: peer GPU %d: p2p %s between the cards - %s\n", o.peer_device,
+                     peer.p2p() ? "yes" : "no",
+                     peer.p2p() ? "the peer also computes its experts' prompt rows (--peer-prefill-rows bounds them)"
+                                : "the prompt path stays on the primary GPU (decode still gains the peer's tier)");
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
@@ -7663,7 +7765,7 @@ int main(int argc, char** argv) {
                 if (own_ok) {   // the card funds its buffers at any chunk the scan can pick: nothing is lent
                     const strata::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
-                    if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+                    if (vram_info(&fb, &tb) == cudaSuccess) {
                         if ((uint64_t) fb >= need + (3ull << 29)) continue;
                     } else (void) cudaGetLastError();
                 }
@@ -8103,7 +8205,7 @@ int main(int argc, char** argv) {
                     for (PfPart& p : pf_parts) {
                         const strata::core::OnDevice on(p.dev);
                         size_t fb = 0, tb = 0;
-                        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                        if (vram_info(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
                         const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk, srcp != nullptr);
                         if ((uint64_t) fb >= need + (3ull << 29)) {
                             std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
@@ -8144,7 +8246,7 @@ int main(int argc, char** argv) {
             borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
             borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            vram_info(&free_b, &total_b);
             static constexpr int64_t candidates[] = {2048, 1536, 1024, 512};
             for (const int64_t candidate : candidates)
                 if (strata::prefill::Prefill::bytes_needed(g, ss, candidate) + (512ull << 20) <=
@@ -8234,7 +8336,7 @@ int main(int argc, char** argv) {
                     const int dev = i == 0 ? -1 : stages[i - 1]->dev;
                     const strata::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
-                    cudaMemGetInfo(&fb, &tb);
+                    vram_info(&fb, &tb);
                     const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c, srcp != nullptr);
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
@@ -9697,6 +9799,10 @@ int main(int argc, char** argv) {
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            if (peer.valid()) {   // upward tier move first: peer experts hot enough for the fast card are evicted
+                int nev = 0;      // here, so the primary's selection below sees them as ordinary candidates
+                if (!peer.nominate_for_primary(drive.d.usage.data(), host_res.data(), o.adapt_swaps, nev)) return false;
+            }
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -10378,7 +10484,7 @@ int main(int argc, char** argv) {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            vram_info(&free_b, &total_b);
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
@@ -10417,7 +10523,7 @@ int main(int argc, char** argv) {
             for (const auto& stp : stages) {
                 const strata::core::OnDevice on(stp->dev);
                 size_t sf = 0, stot = 0;
-                if (cudaMemGetInfo(&sf, &stot) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                if (vram_info(&sf, &stot) != cudaSuccess) { (void) cudaGetLastError(); continue; }
                 const int64_t sf_mib = (int64_t) (sf >> 20);
                 const int later_reserve = o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
                 if (sf_mib >= 512)
@@ -10439,7 +10545,7 @@ int main(int argc, char** argv) {
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            vram_info(&free_b, &total_b);
             // "Experts in VRAM" is every tier, not one card's.  This used to report `xcache` alone, so a layer split
             // showed CUDA0's cache as if it were the whole GPU's: a 4-GPU 256K run read 3327 experts when the four
             // cards held 13320, and the Monitor tab was wrong by 4x for every multi-GPU config.  The tiers are
@@ -10611,7 +10717,7 @@ int main(int argc, char** argv) {
             }
             const auto t0 = Clock::now();
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            vram_info(&free_b, &total_b);
             const int64_t want_free = (int64_t) reserve << 20, mapped = xcache.mapped_bytes();
             const int64_t before = xcache.slots();
             // what stays at least: the prompt path's smallest loan (256 tokens) and the 128 slots it must leave
@@ -10668,7 +10774,7 @@ int main(int argc, char** argv) {
                 res_upload();
             }
             relend();
-            cudaMemGetInfo(&free_b, &total_b);
+            vram_info(&free_b, &total_b);
             std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
                                  "(%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s\n",
                          reserve, (long long) before, (long long) xcache.slots(), (long long) xcache.full_slots(),
@@ -11367,7 +11473,7 @@ int main(int argc, char** argv) {
             {   // #2065: said, never changed - the free VRAM now (the verify windows' captures and the batch layouts
                 // eat into what startup reported), once per 128 MiB lower it gets
                 size_t vf_b = 0, vt_b = 0;
-                if (cudaMemGetInfo(&vf_b, &vt_b) == cudaSuccess) {
+                if (vram_info(&vf_b, &vt_b) == cudaSuccess) {
                     const int64_t vf = (int64_t) (vf_b >> 20);
                     g_req_vram_free_mib.store(vf);
                     static int64_t low_said_at = INT64_MAX;

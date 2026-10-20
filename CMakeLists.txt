@@ -315,6 +315,22 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+if(STRATA_BUILD_TESTS)
+  # tools/dual_gpu_plan_check.cpp (PLAN-dual-gpu.md Phase 0) is NOT built here: it is written against
+  # strata/plan/vram_plan.hpp, which upstream 0.1.40 removed.  The source stays for the 0.1.39 branch and as
+  # documentation of how the peer-tier ladder was sized before the model was downloaded.
+
+  # PLAN-dual-gpu.md Phase 3: per-device --vram-cap parsing and clamp arithmetic
+  add_executable(vram_cap_test tests/core/vram_cap_test.cpp)
+  target_link_libraries(vram_cap_test PRIVATE strata_plan)
+  add_test(NAME vram_cap_test COMMAND vram_cap_test)
+
+  # the peer-to-primary promotion rule (top-third heat, evicted toward the fast card)
+  add_executable(peer_promotion_test tests/core/peer_promotion_test.cpp)
+  target_link_libraries(peer_promotion_test PRIVATE strata_plan)
+  add_test(NAME peer_promotion_test COMMAND peer_promotion_test)
+endif()
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)

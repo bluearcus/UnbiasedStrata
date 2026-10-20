@@ -40,10 +40,11 @@ public:
     PeerExperts& operator=(const PeerExperts&) = delete;
 
     /// Opens the tier on `device`: fills it with the first pairs of `ranked` that `primary` does not hold, as many
-    /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).
+    /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).  `cap_mib` (> 0) and
+    /// `blocker_b` are that card's --vram-cap entry and blocker: the tier sizes itself as the smaller card would.
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-              std::string& err);
+              std::string& err, int64_t cap_mib = 0, uint64_t blocker_b = 0);
     void close();
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
@@ -71,9 +72,16 @@ public:
     /// or -1) nor the peer holds into the peer's least-used slots.  Copies run on the peer's refill stream; a
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
+    /// Promotion pass, called BEFORE the primary's own adapt in the same round: evicts peer-held experts whose
+    /// heat ranks inside the top third of their layer's primary residents (peer_promotion.hpp), which makes them
+    /// ordinary primary candidates that round - the primary's gain-sorted machinery then pulls the deserving ones
+    /// up to the faster card.  Host-side only (a residency-table update; the copies are the primary's swaps).
+    bool nominate_for_primary(const float* usage, const int32_t* res0, int max_n, int& nominated);
     void apply_pending(bool wait);
 
     int64_t resident() const { return resident_; }
+    int64_t slots() const { return cache_.slots(); }   ///< the tier's slot count (0 before open)
+    int64_t nominated() const { return nominated_; }   ///< cumulative promotion nominations (upward tier moves)
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
     bool launched_direct() const { return launched_direct_; }
     double gib() const { return cache_.gib(); }
@@ -90,7 +98,10 @@ private:
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
-    int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
+    int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0, nominated_ = 0;
+    std::vector<int32_t> last_forced_;   ///< per-(layer, expert) adapt round of the last promotion nomination
+    int32_t adapt_round_ = 0;            ///< adapt rounds since open (the nomination cooldown clock)
+    static constexpr int32_t kPromoCooldown = 8;   // adapt rounds before an expert may be re-nominated
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
     float* h_x_ = nullptr;   float* d_x_ = nullptr;   // n_tok x n_embd

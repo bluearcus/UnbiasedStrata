@@ -1,6 +1,9 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
 
+#include "strata/core/peer_promotion.hpp"
+#include "strata/core/vram_cap.hpp"
+
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -121,7 +124,7 @@ void PeerExperts::close() {
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-                       std::string& err) {
+                       std::string& err, int64_t cap_mib, uint64_t blocker_b) {
     close();
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
@@ -135,6 +138,9 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     n_expert_ = n_expert;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    last_forced_.assign((size_t) (n_layers * n_expert), kNotResident);   // never nominated
+    adapt_round_ = 0;
+    nominated_ = 0;
     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
         int a = 0, b = 0;
         cudaDeviceCanAccessPeer(&a, primary_device(), device);
@@ -185,6 +191,10 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     // the pairs the primary does not hold, in rank order, as many as fit
     size_t free_b = 0, total_b = 0;
     if (!ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
+    if (cap_mib > 0 && total_b > 0) {   // --vram-cap on this card: size the tier as the smaller card would
+        const uint64_t all = total_b > free_b ? total_b - free_b : 0;
+        free_b = (size_t) vram_capped_free(free_b, all, (uint64_t) cap_mib, blocker_b);
+    }
     const uint64_t reserve = (uint64_t) std::max(reserve_mib, 128) << 20;
     const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
     std::vector<std::pair<int32_t, int32_t>> pick;
@@ -320,6 +330,24 @@ bool PeerExperts::finish(float* out, std::string& err) {
     for (size_t r = 0; r < row_of_.size(); ++r)
         std::memcpy(out + (size_t) row_of_[r] * H, h_out_ + r * H, (size_t) H * sizeof(float));
     launched_rows_ = 0;
+    return true;
+}
+
+bool PeerExperts::nominate_for_primary(const float* usage, const int32_t* res0, int max_n, int& nominated) {
+    nominated = 0;
+    if (!valid() || max_n <= 0) return true;
+    ++adapt_round_;
+    std::vector<Promotion> promos;
+    select_promotions(usage, res0, res_.data(), n_layers_, n_expert_, last_forced_.data(), adapt_round_,
+                      kPromoCooldown, max_n, promos);
+    for (const Promotion& p : promos) {
+        const size_t i = (size_t) p.layer * n_expert_ + p.expert;
+        if (res_[i] < 0) continue;
+        res_[i] = kNotResident;     // evicted now: the CPU computes it meanwhile, the primary may take it up
+        last_forced_[i] = adapt_round_;
+        ++nominated;
+    }
+    nominated_ += nominated;
     return true;
 }
 
