@@ -62,6 +62,7 @@ def write_millideg(path, temp_c):
     if d:
         os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d or ".", prefix=".vram")
+    os.fchmod(fd, 0o644)               # mkstemp defaults to 0600; the reader is another program (and you)
     with os.fdopen(fd, "w") as f:
         f.write(f"{int(round(temp_c * 1000))}\n")
     os.replace(tmp, path)              # atomic: CoolerControl never reads a half-written file
