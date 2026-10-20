@@ -68,3 +68,36 @@ Worth doing **if** aggregate throughput matters more than per-stream latency, an
 trade with a measurement rather than a guess. The cheapest first step is not the front end at all: drive the
 engine's `BGEN` protocol directly from a script with two slots and `--batch-mtp`, and measure at 32K and 262K. That
 answers "is there a win here" in an afternoon, before any front-end work.
+
+---
+
+## 7. Measured: batching does not pay here, and the VRAM cost is not the reason
+
+`tools/dual_gpu_bgen_probe.sh` drives the engine's own protocol (no front end, no peer) with the same prompts
+single-stream and as two slots with `--batch-mtp`, at both window sizes. The engine confirms the feature engaged:
+`--batch: 2 slot sessions on CUDA0`, `--batch-mtp: 2 slot drafters on CUDA0 ... sharing the solo drafter's weights`.
+
+| Window | Mode | slot 0 | slot 1 | **aggregate** | expert slots |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 32K | single | 94.8 | - | **94.8** | 10,679 |
+| 32K | 2 slots + batch-mtp | 33.8 | 51.2 | **67.7** (-29%) | 10,150 |
+| 262K | single | 83.6 | - | **83.6** | 9,446 |
+| 262K | 2 slots + batch-mtp | 25.0 | 36.8 | **50.0** (-40%) | 6,436 |
+
+Two things this settles:
+
+1. **The 32K row rules out the VRAM explanation.** At 32K a slot session is 0.38 GiB, so the cache barely moved
+   (10,679 -> 10,150) - and the aggregate still fell 29%. The loss is intrinsic to batching on this machine, not a
+   consequence of a smaller expert cache.
+2. **At 262K the VRAM cost is real but secondary**: 2.25 GiB per slot, cache 9,446 -> 6,436 (-32%), on top of the
+   same intrinsic loss.
+
+**Why**, consistently with everything else measured here: the CPU expert pool is the tail (the 10900X runs the
+AVX-2 kernels), so two slots multiply the tail's work while sharing only the GPU-side work; and each window then
+carries two sessions' rows, two drafters' proposals and the staging that goes with them. On a configuration where
+the pool is *not* the tail (a quantization small enough for all experts to live in VRAM, or a much faster CPU) the
+balance would change - that is the case upstream's +15%/+31-39% numbers describe.
+
+**Decision: no front-end batching work.** The 4-6 day slot implementation would buy a 29-40% *regression* here.
+The probe cost an afternoon and is kept as the instrument for the day the configuration changes (Q2_0/IQ2_XS, or a
+VBMI-capable CPU).
