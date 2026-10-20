@@ -1,5 +1,38 @@
 # Cooling: the 3090's GDDR6X temperature, and what drives the fans
 
+## Status — applied and live as of 2026-10-20
+
+Every step below says who did it and what proves it.  If you are picking this up later, this section is the truth;
+the prose further down is background.
+
+### Done
+
+| # | Step | Who | Proof |
+| --- | --- | --- | --- |
+| 1 | Card's own fans follow VRAM temperature | assistant, via the LACT daemon socket | `/etc/lact/config.yaml`: `fan_control_enabled: true`, `temperature_key: vram`, curve `40→0.30 … 80→1.00` on `10DE:2204-…-0000:17:00.0` |
+| 2 | CoolerControl installed, six channels calibrated | assistant wrote the commands, you ran them | `calibrations.json` holds up/down curves for `fan3…fan6` on device `8b76273c…` |
+| 3 | VRAM sensor bridge | assistant wrote it, you installed it | `vram-sensor.service` active; `/run/vramsensor/vram.temp1` mode `0644`, updating |
+| 4 | Custom File sensor inside CoolerControl | you, GUI | `[[custom_sensors]] id = "sensor_8f5c0d26"`, path `/run/vramsensor/vram.temp1` |
+| 5 | VRAM-keyed profiles applied to `fan5` + `fan6`, stale `GPUs Intake` profile removed | assistant wrote the patch, you ran it with sudo | `config.toml` md5 `2b0f4615…`; `[device-settings.8b76273c…]` with `fan5`/`fan6`; backup `/etc/coolercontrol/config.toml.vrambak-20261020-221247` |
+| 6 | UI state confirmed | you, read-only | `fan5` = *3090 Intake (VRAM)*, `fan6` = *Top Rear Exhaust (VRAM)*, `fan3`/`fan4` = *Unmanaged*. **Nothing had to be created in the UI for this step.** |
+| 7 | Load test | assistant | 30,074 prompt + 4,000 generated tokens in 57.4 s; VRAM 58 → 68 °C; `pwm5` 110 → 140 (43 → 55 %); `pwm6` 151 → 181 (59 → 70 %); no stalls |
+
+### Open, with owner
+
+| # | Item | Owner | Blocked on |
+| --- | --- | --- | --- |
+| O1 | Confirm the 3090's **own** fan channel reads *Unmanaged* in CoolerControl, so LACT and CoolerControl are not both driving the card | you, read-only | nothing — one minute |
+| O2 | Sustained soak, 12–15 min of continuous decode at 262K, to see whether VRAM actually reaches the 75–85 °C band where the intake curve overtakes its old BIOS pin of 57 % | assistant | your go-ahead: it occupies the model endpoint for ~15 min |
+| O3 | If the soak shows VRAM never getting there, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant, as a merge patch | outcome of O2 |
+| O4 | Create one **CPU-sourced Graph profile** | you, GUI | only the UI knows the CPU sensor's internal `temp_name`; this cannot be authored blind |
+| O5 | Mix Profiles for `fan1`/`fan3`/`fan4` (CPU curve vs VRAM curve, function `Max`) | assistant | the uid from O4 |
+| O6 | BIOS: `SYS_FAN5`/`SYS_FAN6` to fixed/ignore | you, at the next reboot | optional — no fighting observed yet, the duties track CoolerControl, not the firmware |
+
+### The one question to answer next
+
+O2: run the soak or not.  Everything else either has an owner already or depends on it.
+
+
 The number that matters on this rig is **memory temperature on the 3090**, not core temperature.  The card is
 power-capped at 300 W, its core sits in the low 60s, and the GDDR6X on the backplate is what runs hot - 86 °C
 sustained was seen in a cooler room, and this loft is unconditioned, so summer is a different machine.  The 4070
@@ -145,7 +178,7 @@ Measured on a 2000-token generation:
 The curve's top point (80 °C → 100 %) was not reached in a cold room; in summer it will be.  The 4070 stays on
 automatic (`fan_control_enabled: false`).
 
-## To do: CoolerControl for the case fans (needs root)
+## Setup: CoolerControl for the case fans (done, kept for re-install / another machine)
 
 ```bash
 # 1. install (Debian 13 trixie is supported: >= Bookworm)
@@ -155,9 +188,10 @@ sudo apt update
 sudo apt install coolercontrol lm-sensors          # coolercontrold comes with it
 sudo systemctl enable --now coolercontrold
 
-# 2. the sensor bridge
-sudo cp tools/vram_sensor.py /usr/local/bin/vram-sensor && sudo chmod 0755 /usr/local/bin/vram-sensor
-sudo cp tools/vram-sensor.service /etc/systemd/system/
+# 2. the sensor bridge (absolute paths: paste from any directory)
+sudo cp /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/vram_sensor.py /usr/local/bin/vram-sensor
+sudo chmod 0755 /usr/local/bin/vram-sensor
+sudo cp /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/vram-sensor.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now vram-sensor.service
 cat /run/vramsensor/vram.temp1                     # e.g. 72000 = 72.0 C in millidegrees
 
@@ -189,7 +223,7 @@ Then in the interface:
    exporter script is unnecessary, and plain `fancontrol` would do it too.  Hardware purchase; the exporter is the
    no-cost equivalent.
 
-## The config patch (`tools/coolercontrol/vram_profiles.py`)
+## The config patch (`tools/coolercontrol/vram_profiles.py`) — applied 2026-10-20
 
 CoolerControl's configuration lives in `/etc/coolercontrol/config.toml` (TOML, daemon-owned; `overrides.toml` is the
 hand-editable name file).  Its API requires authentication for reads as well as writes, so the patch is applied to
@@ -230,17 +264,21 @@ the GUI (pick the CPU sensor from the dropdown), note its uid from the config af
 mechanical.
 
 ```bash
+# Every command below is absolute: paste it from any directory, in any shell.
+cd /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata
+
 sudo systemctl stop coolercontrold
-sudo python3 tools/coolercontrol/vram_profiles.py plan      # look first
-sudo python3 tools/coolercontrol/vram_profiles.py apply --start
-sudo python3 tools/coolercontrol/vram_profiles.py backups   # what to fall back to
+sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/vram_profiles.py plan
+sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/vram_profiles.py apply --start
+sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/vram_profiles.py backups
+
 # undo, if anything looks wrong:
 sudo systemctl stop coolercontrold
-sudo python3 tools/coolercontrol/vram_profiles.py revert
+sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/vram_profiles.py revert
 sudo systemctl start coolercontrold
 ```
 
-## Verification checklist
+## Verification checklist (items 1-3 done; 4 is O2 above)
 
 1. `journalctl -u vram-sensor -n 20` → `... <- 72.0 C`, and `/run/vramsensor/vram.temp1` tracks it.
 2. CoolerControl Home: the `3090 VRAM` sensor charts, and matches LACT's `VRAM` reading.
