@@ -9785,9 +9785,18 @@ int main(int argc, char** argv) {
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
             // STRATA-FORK-BEGIN: the promotion half of the swap - only the candidates the primary actually admitted
             // leave the peer (the copies for them are already queued above)
-            if (!promoted.empty())
-                for (const Swap& s : swaps)
-                    if (promoted[(size_t) s.layer * g.n_expert + s.in]) peer.evict(s.layer, s.in);
+            if (!promoted.empty()) {
+                for (const Swap& s : swaps) {
+                    if (!promoted[(size_t) s.layer * g.n_expert + s.in]) continue;
+                    // the true exchange: the promoted expert leaves the tier and the primary's victim, SAME LAYER,
+                    // takes its slot - so the demotion lands in VRAM, not in the CPU pool
+                    std::string xerr;
+                    if (!peer.swap_in_place(s.layer, s.in, s.out, *srcp, xerr)) {
+                        std::fprintf(stderr, "strata serve: %s\n", xerr.c_str());
+                        return false;
+                    }
+                }
+            }
             // STRATA-FORK-END
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;

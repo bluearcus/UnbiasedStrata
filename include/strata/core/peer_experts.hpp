@@ -83,6 +83,12 @@ public:
     /// Drops (layer, expert) from the tier after the primary admitted it.  The slot is left for the tier's own
     /// refill, which cannot take it back (the primary holds it now).
     void evict(int64_t layer, int64_t expert);
+    /// **The second half of a promotion: the true two-card exchange.**  The slot that held `expert_in` takes
+    /// `expert_out`'s blob instead (the primary's victim, same layer - the tier's slots are sized per layer, so
+    /// the blob fits exactly), and `expert_in` leaves the tier because the primary now holds it.  Both experts stay
+    /// in VRAM: the hot one moves up a tier, the cold one down one, and neither reaches the CPU pool.  The copy is
+    /// blocking on the tier's refill stream (~1-2 MB), called between verify windows.
+    bool swap_in_place(int64_t layer, int32_t expert_in, int32_t expert_out, ExpertSource& src, std::string& err);
     void apply_pending(bool wait);
 
     int64_t resident() const { return resident_; }

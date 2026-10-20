@@ -343,6 +343,29 @@ bool PeerExperts::promotion_candidates(const float* usage, const int32_t* res0, 
     return true;
 }
 
+bool PeerExperts::swap_in_place(int64_t layer, int32_t expert_in, int32_t expert_out, ExpertSource& src,
+                                std::string& err) {
+    if (!valid() || layer < 0 || layer >= n_layers_) return true;
+    const size_t i_in = (size_t) layer * n_expert_ + expert_in;
+    const size_t i_out = (size_t) layer * n_expert_ + expert_out;
+    const int32_t slot = res_[i_in];
+    if (slot < 0) return true;                       // the tier no longer holds it: nothing to hand over
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const int64_t bytes = (int64_t) lay.blob_bytes(layer);
+    const uint8_t* b = src.blob(layer, expert_out);
+    if (b == nullptr) return true;                   // the demoted expert cannot be read: leave the tier as it is
+    On on(device_);
+    if (!cache_.fill_slot_blocking(slot, b, err, bytes)) {
+        err = "peer experts: swap-in failed: " + err;
+        return false;
+    }
+    res_[i_in] = kNotResident;                       // the primary holds it now
+    res_[i_out] = slot;                              // the primary's victim, in the slot it freed
+    last_forced_[i_out] = last_forced_[i_in];
+    ++nominated_;                                    // the census counts exchanged pairs
+    return true;
+}
+
 void PeerExperts::evict(int64_t layer, int64_t expert) {
     if (!valid() || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return;
     const size_t i = (size_t) layer * n_expert_ + expert;

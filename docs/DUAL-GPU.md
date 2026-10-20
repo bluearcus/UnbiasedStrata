@@ -87,6 +87,24 @@ cards being VRAM means residency does not improve; only bandwidth asymmetry coul
 peer is not bandwidth-starved (`peer_ms_wait` was 0.14 ms/token). The coordinated design removed the bounce but
 not the demotion, which is why it did not recover the loss either.
 
+**The demotion destination was the flaw: with a true exchange, promotion stops hurting.** The first coordinated
+design still sent the primary's victim to the CPU pool, which is why it stayed monotone-negative. The exchange
+(`PeerExperts::swap_in_place`) hands that victim, which is always in the *same layer* as the promoted expert - so
+the tier's per-layer sized slot fits it exactly - into the slot the promoted expert vacates. Both experts stay in
+VRAM; one H2D copy each way, blocking (~1-2 MB) between windows. Re-measured with it:
+
+| Arm | Steady 32K | Shift A (mean) | **Shift B1 (the dip)** | Shift B3 |
+| --- | ---: | ---: | ---: | ---: |
+| promotion off | 95.8 | 93.3 | 84.1 | 98.5 |
+| max 2 / gain 3, exchange | **97.8** | 93.0 | **88.0** | 96.2 |
+| max 8 / gain 2, exchange | 96.9 | 88.1 | 81.2 | 90.7 |
+| single GPU (control) | - | 91.4 | 75.2 | 97.4 |
+
+So a *tight* rate with the exchange is inside noise on steady state (+2%), **halves the transition dip** (88.0
+against 84.1, and against the control's 75.2), and a loose rate is still clearly bad. The dip improvement is one
+request of one arm, i.e. a signal that needs repetitions rather than a proven win - which is why the default stays
+off. `nominated` counts exchanged pairs (it read 0 for a while because the exchange stopped calling `evict()`).
+
 **The rate is the dominant variable.** The pass runs every `--adapt-every` windows (default 4) and was allowed up
 to `--adapt-swaps` (96) promotions per pass; the soak logs show it averaging ~18 per pass. Sweeping the budget at
 32K (XXS, peer on, 3 runs each) gives a clean monotone curve:
