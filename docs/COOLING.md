@@ -19,6 +19,56 @@ draws ~19 W in this workload and is left alone.
 That is the "not configured sensibly" part: the case fans follow the CPU while the GPU's memory is the hot thing,
 and the card's own fans sit at 30 % because its vBIOS target temperature is 83 °C.
 
+## Which header is which
+
+Six headers on the NCT6797 (`CPU_FAN1`, `PUMP_FAN1`, `SYS_FAN1-4`), six tach inputs, and the physical fans are:
+CPU AIO (radiator pair + pump), a front intake pair, a GPU intake fan, a rear exhaust, and a top exhaust pair -
+so some groups share a header via a splitter.
+
+What the board reports without touching anything (`/sys/class/hwmon/hwmon2`, plus a 25 s CPU-only load of 10
+busy loops to see which tach responds):
+
+| header | PWM | BIOS curve source | written PWM | tach | response to a CPU-only load |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `pwm1` | `temp_sel=7` **PECI (CPU)** | 125 | `fan1` 788 → **1226** | moves strongly |
+| 2 | `pwm2` | `temp_sel=7` **PECI (CPU)** | 125 | `fan2` **4166 → 4153** | constant ~4150 |
+| 3 | `pwm3` | `temp_sel=7` **PECI (CPU)** | 197 | `fan3` 1045 → **1191** | moves |
+| 4 | `pwm4` | `temp_sel=7` **PECI (CPU)** | 199 | `fan4` 1093 → **1212** | moves |
+| 5 | `pwm5` | `temp_sel=1` **SYSTIN** | 147 | `fan5` 1225 → 1205 | **does not move** |
+| 6 | `pwm6` | `temp_sel=1` **SYSTIN** | 178 | `fan6` 1020 → 1009 | **does not move** |
+
+The curves themselves (from `pwmN_auto_pointN_*`):
+
+- headers 1-2: `40->33, 55->96, 70->160, 85->255` and `27->12, 52->84, 71->163, 85->244` - real CPU curves.
+- headers 3-4: `40->127, 55->178, 72->226, 85->255` - real CPU curves, already running fairly high (197/199 of 255).
+- **headers 5-6: `25->147, 35->147, 45->147, 55->147, 101->255`** and `25->178, ... 55->178, 101->255` - a flat
+  duty (57 % and 70 %) that only changes if something reaches **101 °C**.  That is the "not configured sensibly"
+  smoking gun: two of the case fans are pinned and respond to nothing.
+
+Reading the evidence together: `fan2` at a constant 4150 is the **AIO pump** on `PUMP_FAN1`; `fan1` moves most
+with the CPU, so it is the **AIO radiator pair** on `CPU_FAN1`; headers 3-4 are two case headers following CPU
+heat; headers 5-6 are the two case fans that are pinned.  Which of 3-6 is the front intake pair, the GPU intake,
+the rear exhaust and the top exhaust is **not** discoverable from software - the board does not label them.
+
+### Confirming it (ranked, easiest first)
+
+1. **CoolerControl's channel pages** (the GUI answer, and it is being installed anyway): open *Cooling*, pick a
+   channel, set it to a **fixed duty** - 100 %, then 20 %, then back - and watch which physical fan changes while
+   its RPM readout moves in the same page.  Six channels, six answers, nothing unplugged.  Cross-check against
+   the table above: the channel whose RPM sits at ~4150 is the pump, the one that jumps with CPU load is the AIO
+   radiator, and the two that never move are the pinned pair.
+2. **BIOS → Hardware Monitor**: the fan table lists each header with its current RPM; compare with the tach values
+   above (`fan1..fan6`) to line up header numbers with `pwmN`.
+3. **Physically**, if the first two are ambiguous: unplug one fan, watch `sensors` for the tach that drops to 0,
+   plug it back.  One fan at a time.
+
+### What the mapping is for
+
+Once named: the **GPU intake, front intake pair, rear and top exhaust** are the channels CoolerControl should
+drive off the `3090 VRAM` sensor (headers 3-6 are the candidates; 5-6 are the pinned ones that most need a real
+curve).  `CPU_FAN1` (AIO radiator) and `PUMP_FAN1` (pump) stay on their CPU curves - the 9-worker CPU pool is
+their problem, and the pump should not be modulated at all.
+
 ## The split
 
 | Layer | Tool | Why |
