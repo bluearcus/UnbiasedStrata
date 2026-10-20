@@ -81,3 +81,38 @@ If a full rebase is not wanted now, a cheaper intermediate exists: **port only t
 (`src/` and `include/`, leaving our front end in place) — that recovers the decode speed without touching the
 CLI. It is not straightforward (the front end and engine share the line protocol, which also changed), but it
 is the smaller of the two jobs and worth evaluating first.
+
+---
+
+## 7. Status after the first pass (branch `rebase-0.1.45`, commit `96b9f9c`)
+
+Done: R1, R3, R4, and R2's engine work. The rebased tree builds (`build-rk/`), `vram_cap_test` and
+`peer_promotion_test` pass, and the ported features work on the rig: `--vram-cap 0:22000,1:10000` held back
+2,126 / 1,873 MiB per card, expert cache 9,248 slots, **peer 5,377 experts (8.67 GiB), combined 14,625 of 24,576
+on the GPUs, p2p no**, and a generation completed.
+
+**Performance check (same pack, prompts and settings, 3-run medians):**
+
+| Cell | Fork 0.1.39 | Upstream 0.1.45 | **Rebased fork** | vs old fork |
+| --- | --- | --- | --- | --- |
+| 1K | 105.2 | 113.4 | **111.1** | +5.6% |
+| 4K | 81.4 | 94.9 | **94.0** | +15.5% |
+| 32K | 75.1 | 92.8 | **89.9** | +19.7% |
+
+The rebased fork is within 1-3% of upstream (inside the +/-10 tok/s run spread) and 6-20% faster than our 0.1.39
+branch. That confirms the deficit was the version gap alone, not the fork's changes.
+
+Still open:
+
+* **R5 - front-end peer validation on the new program.** The rewritten front end passes engine flags after `--`
+  verbatim, so `--peer-device` and its knobs already work; what is missing is our validation and defaults
+  (ordinal check, live P2P probe before the load, reserve 2500, `--peer-prefill-rows 0` without P2P, `--ple-io
+  direct` under a peer, the low-RAM fallback below ~56 GiB, and the `STRATA_DUMP_EARGS` inspection hook).
+* **Observability (was Phase 1).** Upstream 0.1.45 has **no STATS protocol** and a minimal `/health`
+  (`status, busy, service, loaded`), so the peer counters need a new vehicle - either a new engine command
+  consumed by `frontend/strata_context.cpp`'s `get_health`, or per-request stderr lines like the cache hit rate
+  the engine already prints.
+* **R6 - docs and scripts for the new CLI** (`-m/--model` before `--`, engine flags after; `--engine PATH`;
+  no `--engine` self-exec). Every recipe in `docs/DUAL-GPU.md` and the benchmark/pull scripts still uses the
+  0.1.39 form.
+* **Gates G1/G2/G4/G6 re-run** on the rebased engine with the peer (the numbers above are single-GPU).
