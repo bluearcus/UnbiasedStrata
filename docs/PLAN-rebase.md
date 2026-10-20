@@ -128,9 +128,28 @@ Still open:
 **G1 (start with the peer):** passes through `tools/strata-dual` - peer line, `p2p no`, and `/health` reporting
 `vram_slots 10536`, `peer_slots 5297` at the 2500 MiB reserve.
 
-**G2 (logit parity): blocked on another upstream change.** 0.1.45 removed `--teacher-force` and `--spec-oracle`,
-and `--dump-logits` prints "logits dumped" but writes **zero rows** in this configuration (0-byte files, both
-configs). G2 needs either the dump fixed or a different instrument; it is the one gate still open.
+**G2 (logit parity): retired, with the reasons recorded.** 0.1.45 removed `--teacher-force` and `--spec-oracle`,
+and `--dump-logits` is now **dead**: the option is still advertised in `--help`, the file is opened and "logits
+dumped" printed, but there is no write path left in `src/program/generate.cpp` (the 0.1.39 branch has one; this
+one does not). That is an upstream bug, not ours - worth reporting rather than patching, and patching it would be
+exactly the kind of engine-internals surface the fork strategy exists to avoid.
+
+What those two instruments were for, and why we can do without them:
+
+| Instrument | Serving value | Development value | Verdict |
+| --- | --- | --- | --- |
+| `--dump-logits` | none | the only *numeric* comparison available: distributions instead of tokens, for kernel/quant/rebase validation | **do not restore**; report upstream |
+| `--teacher-force` + `--spec-oracle` | none | makes comparison valid at every position (identical prefixes in both runs) | **not needed**: position 0 already shares its prefix, and that is enough for a parity smoke test |
+
+The peer-fidelity question that motivated the harness is answered more sharply without either instrument: on
+0.1.39, single-vs-single was **bit-identical at every position** (KL 0.0000 twice), and every position whose
+routing stayed entirely on card 0 was exactly equal between peer and single - the residual difference is CUDA
+(peer) versus the AVX-2 CPU pool (single), and the peer scored slightly *better* likelihood on the sample.
+
+G2's standing form is therefore: (a) single-vs-single token identity on fixed prompts, (b) peer-vs-single token
+identity where prefixes coincide, (c) the row-level invariant above. If numeric regression detection is ever
+wanted after a rebase, the cheap vehicle is an env-gated one-line print of position 0's top-5 `(id, logit)`
+pairs - about 15 lines in a marked block, no file dump and no protocol change - not a restoration of the dump.
 
 **G6 (throughput), same pack/prompts/settings, 3-run medians, rebased engine:**
 
