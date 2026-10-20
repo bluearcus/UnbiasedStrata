@@ -39,6 +39,7 @@ import argparse
 import datetime as dt
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,12 @@ MB_DEVICE = "8b76273cb2328ccea47d925147ddb6ab7acacd5ebee2f4fd1e814716d9470129"  
 
 GPU_INTAKE_UID = "7c1f6a02-9b4e-4f1a-8d30-5e2b0c7a9101"
 TOP_REAR_UID = "7c1f6a02-9b4e-4f1a-8d30-5e2b0c7a9102"
+
+# The "GPUs Intake" profile already in the file is removed rather than left dangling: its curve starts at 13% duty
+# at 0 C, which is below fan5's measured 20% stall duty, and an unused profile with a stall-breaking floor sitting in
+# the list is one accidental click away from a stopped intake fan.  Revert restores it byte-for-byte.
+REMOVE_PROFILE_UID = "46578b93-50b4-4e6f-8785-89c5cde58ce1"
+REMOVE_PROFILE_NAME = "GPUs Intake"
 
 PROFILES = f'''[[profiles]]
 uid = "{GPU_INTAKE_UID}"
@@ -95,6 +102,53 @@ def read_config(path):
         sys.exit(f"cannot read {path}: {e}  (this script needs root for the real config)")
 
 
+HEADER_RE = re.compile(r"^\[\[?[A-Za-z0-9_.-]+\]\]?\s*$")
+
+
+def split_segments(text):
+    """Split TOML into top-level table segments.  Trailing comment/blank lines are handed to the FOLLOWING segment,
+    so deleting a segment cannot eat the comment block that documents the next table."""
+    lines = text.split("\n")
+    segs = [[None, []]]                       # [header, body]
+    for line in lines:
+        if HEADER_RE.match(line):
+            segs.append([line, []])
+        else:
+            segs[-1][1].append(line)
+    for i in range(len(segs) - 1):            # push trailing comments/blank lines forward
+        body = segs[i][1]
+        keep = len(body)
+        while keep > 0 and (not body[keep - 1].strip() or body[keep - 1].lstrip().startswith("#")):
+            keep -= 1
+        if keep < len(body):
+            segs[i + 1][1] = body[keep:] + segs[i + 1][1]
+            segs[i][1] = body[:keep]
+    return segs
+
+
+def join_segments(segs):
+    out = []
+    for header, body in segs:
+        if header is not None:
+            out.append(header)
+        out.extend(body)
+    return "\n".join(out)
+
+
+def remove_profile(text, uid, name):
+    """Delete exactly one [[profiles]] segment by uid.  Refuses if it is not found or if anything else would go."""
+    segs = split_segments(text)
+    doomed = [i for i, (h, b) in enumerate(segs)
+              if h == "[[profiles]]" and any(l.strip() == f'uid = "{uid}"' for l in b)]
+    if len(doomed) != 1:
+        sys.exit(f"refusing: expected exactly one [[profiles]] segment with uid {uid!r}, found {len(doomed)}")
+    body = segs[doomed[0]][1]
+    if not any(name in l for l in body):
+        sys.exit(f"refusing: the segment with uid {uid!r} is not the {name!r} profile - not deleting it")
+    kept = [s for i, s in enumerate(segs) if i != doomed[0]]
+    return join_segments(kept), body
+
+
 def build_patch(text, path):
     if GPU_INTAKE_UID in text or TOP_REAR_UID in text:
         sys.exit("already applied (a vram profile uid is present).  Use 'revert' to undo, or 'backups' to list.")
@@ -103,6 +157,11 @@ def build_patch(text, path):
             sys.exit(f"refusing to edit {path}: anchor {anchor!r} not found - the config is not the shape this script expects")
     out = text.replace(ANCHOR_PROFILES, PROFILES + "\n" + ANCHOR_PROFILES, 1)
     out = out.replace(ANCHOR_SETTINGS, ANCHOR_SETTINGS + "\n" + ASSIGNMENTS, 1)
+    if REMOVE_PROFILE_UID in out:
+        if f'profile_uid = "{REMOVE_PROFILE_UID}"' in out:
+            sys.exit(f"refusing: a channel still applies {REMOVE_PROFILE_NAME!r}; reset that channel first")
+        out, removed = remove_profile(out, REMOVE_PROFILE_UID, REMOVE_PROFILE_NAME)
+        log(f"removing the unused {REMOVE_PROFILE_NAME!r} profile ({len(removed)} lines)")
     return out
 
 
@@ -116,6 +175,10 @@ def validate(text, path):
     missing = [u for u in (GPU_INTAKE_UID, TOP_REAR_UID) if u not in profiles]
     if missing:
         sys.exit(f"REFUSED: profiles not visible after patching: {missing}")
+    if REMOVE_PROFILE_UID in profiles:
+        sys.exit(f"REFUSED: {REMOVE_PROFILE_NAME!r} ({REMOVE_PROFILE_UID}) survived removal")
+    if REMOVE_PROFILE_NAME in profiles.values():
+        sys.exit(f"REFUSED: a profile still named {REMOVE_PROFILE_NAME!r} exists")
     for ch, want in (("fan5", GPU_INTAKE_UID), ("fan6", TOP_REAR_UID)):
         got = settings.get(ch, {}).get("profile_uid")
         if got != want:
@@ -184,10 +247,14 @@ def cmd_plan(a):
     validate(patched, a.config)
     open("/tmp/config.toml.patched", "w", encoding="utf-8").write(patched)
     log("\nno changes written; the patched text is at /tmp/config.toml.patched")
-    log("diff (added lines only):")
-    for line in patched.splitlines():
-        if line not in text.splitlines():
-            log("   +" + line)
+    before, after = text.splitlines(), patched.splitlines()
+    gone = [l for l in before if l not in after]
+    added = [l for l in after if l not in before]
+    log(f"line diff (approximate - identical lines in other profiles cancel out): {len(added)} added, {len(gone)} removed")
+    for line in gone:
+        log("   -" + line)
+    for line in added:
+        log("   +" + line)
 
 
 def cmd_apply(a):

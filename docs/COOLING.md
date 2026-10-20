@@ -214,6 +214,13 @@ What the patch installs: two Graph profiles on the `3090 VRAM` File sensor, appl
 intake)** and **`fan6` (top rear exhaust)** - the two headers pinned by flat BIOS curves.  Curve floors respect the
 measured stall duties (`fan5` will not start below 20%, `fan6` not below 30%).
 
+What it removes: the existing **`GPUs Intake`** profile.  Its curve asks for 13% duty at 0 C, below `fan5`'s measured
+20% stall duty, and an unused profile with a stall-breaking floor left in the list is one mis-click away from a
+stopped intake fan.  Removal is done with a TOML segment splitter (delete the whole `[[profiles]]` block whose uid
+matches, nothing else) rather than a regex, it refuses if the uid is not found exactly once, if the block is not the
+expected profile, or if any channel still applies it; and it hands trailing comment lines to the following table so
+the `# A list of functions ...` header comments survive.  `revert` brings it back byte-for-byte.
+
 What it deliberately does **not** touch: `fan1` (AIO radiator), `fan2` (pump), `fan3` (rear exhaust) and `fan4`
 (top forward exhaust).  `fan3`/`fan4` are already at 76% on a CPU curve doing real work; a VRAM-only curve would
 drop them to 30-48% whenever the GPU is idle and regress CPU cooling.  They need Mix Profiles, and a Mix Profile
