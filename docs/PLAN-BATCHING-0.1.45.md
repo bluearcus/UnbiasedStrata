@@ -101,3 +101,41 @@ balance would change - that is the case upstream's +15%/+31-39% numbers describe
 **Decision: no front-end batching work.** The 4-6 day slot implementation would buy a 29-40% *regression* here.
 The probe cost an afternoon and is kept as the instrument for the day the configuration changes (Q2_0/IQ2_XS, or a
 VBMI-capable CPU).
+
+---
+
+## 8. The implementation already exists — steal it, do not invent it
+
+**PolyStrata (VecSzn/PolyStrata, MIT, HEAD `c54f0ea`) has working batch-slot serving in Python**, and this repo's own
+`PLAN.md` records that v1 deliberately dropped it: *"Replicas, CPU affinity, `--batch` slot scheduling (`BGEN`) |
+drop in v1. One request at a time, queued. Engine `--batch` stays in the tree, 'present, unmeasured'"*
+(`PLAN.md:90`, citing `serve/replicas.py`, `server.py:1572-1900`).
+
+The reference implementation in `serve/server.py` (7,804 lines; ~318 lines touch slots):
+
+| Concern | Reference |
+| --- | --- |
+| per-slot line routing (`BT `/`BDONE ` by slot id) | `server.py:1013` |
+| GEN / BGEN control-line reader with heartbeats | `server.py:1291` |
+| BDONE into the request's figures | `server.py:1381`, `1387`, `1401` |
+| slot release after a consumer leaves (BSTOP) | `server.py:1406` |
+| park / reap orphan slots | `server.py:1449`, `1468` |
+| admission (`pick_slot`) and `slots_view` | `server.py:1905`, `1950` |
+| slot save/restore actions | `server.py:3613` |
+| slot count from the engine | `server.py:738` |
+
+Reference tests to mirror: `serve/test_parallel.py` (877 lines), `test_slots.py` (449), `test_quiet_cancel.py` (226),
+`test_slot_alloc.py` (108) — about **1,660 lines of behaviour** that says exactly what the C++ port must do.
+
+**Two routes, in order of preference:**
+
+1. **Port the reference when batching is worth doing** (i.e. after the CPU-kernel question says the pool can stop
+   being the tail - `docs/PLAN-CPU-KERNEL.md`). Scope: ~300-500 lines of logic in `frontend/strata_context.cpp` +
+   `engine.hpp`, plus mirrored tests. Much better specified than "add slots" from scratch; MIT means we can copy
+   with attribution.
+2. **Wait for upstream.** `PLAN.md` drops it for v1 rather than rejecting it, and the engine half is complete, so
+   PolyStrata/UnbiasedStrata may reinstate it. Worth re-checking their `serve/` at each rebase before writing
+   anything.
+
+Either way the *engine* needs nothing: `--batch`, `--batch-mtp`, `BGEN`/`BT`/`BDONE`/`BSTOP` are all present and now
+measured (`-29% at 32K` without a faster pool, section 7).

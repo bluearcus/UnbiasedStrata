@@ -94,6 +94,28 @@ So the honest order of value is: **kernel -> batching viability -> throughput**,
 answer to E1–E4 is H1, the combined work is 2-3 weeks with a plausible 1.5-1.8x aggregate on two concurrent
 streams; if H2, both projects are dead and the ~98 tok/s single-stream figure is the machine's ceiling.
 
+**The kernel is a gateway to batching, not a throughput win in its own right.** State that plainly in any summary:
+on one stream it buys 0-5%; its whole justification is that it moves the pool back under the GPU path so two slots
+stop costing 29%.
+
+### 4.1 How much slack there really is, and what a bigger quant would need
+
+The 47% figure is an **upper bound**. It comes from fitting `T = max(GPU, pool)` to the starvation test
+(9 workers 81.2 tok/s, 4 workers 68.3), which assumes the pool scales ~linearly from 4 to 9 workers. The 9 -> 16
+sweep was flat, i.e. sublinear above 9, so the true slack is plausibly **25-47%**.
+
+Host RAM arithmetic (62.5 GiB total, ~5.6 GiB engine overhead, experts per the censuses):
+
+| Quant | Experts | + overhead | Verdict |
+| --- | ---: | ---: | --- |
+| IQ3_S (published, measured 88.9 tok/s at 262K) | 46.8 GiB | **52.4 GiB** | fits, ~10 GiB spare - **this is the host's quality ceiling** |
+| IQ4_XS (hypothetical, ~4.25 bpw; not published for this model) | 57.9 GiB | **63.5 GiB** | **does not fit** - short by ~1 GiB before the desktop or page cache |
+
+And even if an IQ4 fit, its compute cost would land at the edge of the slack: the GPU-resident share falls from
+50.5% to ~41% at 262K, raising pool work by ~47% against 25-47% of headroom. So a bigger quant would likely make
+the pool *the* tail - the same failure the 2-slot probe demonstrated at -29%. More quality per byte on this host
+means **expert pruning** (the Coder variant keeps 256 of 512 experts, ~23 GB of expert RAM), not more bits.
+
 ## 5. Risks and confounds
 
 - **Page cache vs storage**: E1 and E2 must read experts that are already cached (the 43 GB shard does not fit in
