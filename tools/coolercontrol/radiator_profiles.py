@@ -19,10 +19,16 @@ TWO PROBLEMS THIS FIXES
 
 WHAT IT WRITES
   profile "CPU (radiator)"      Graph, CPU source, gentle - fan1's duty scale
-  profile "GPU (radiator)"      Graph, 3090 VRAM source, ramping 50-95 C
+  profile "GPU (radiator)"      Graph, 3090 VRAM source, flat until 70 C then ramping - the radiator pair does not
+                                ramp for the 3090 at all below 70 C, because its fans idle at 641 RPM anyway
   profile "Radiator (CPU or VRAM)"  Mix, Max of the two  -> applied to fan1
-  profile "Top Rear Exhaust (VRAM)" curve retuned from 35-90 C to 45-95 C  (the exhaust mix's VRAM member)
+  profile "Top Rear Exhaust (VRAM)" retuned: flat at the 32% floor below 50 C and topping out at 75% rather than
+                                100% - the exhaust mix's VRAM member
   fan5 (GPU intake) is not touched; its calibration starts at 0 RPM so its duty scale is already honest.
+
+The balance strategy here is deliberate: this case has three exhausts and one unobstructed intake, so matching duty
+across them is already negative pressure.  Rather than push the restricted radiator pair harder - which is noisy for
+the air it actually moves - the three exhausts are asked to do less.
 
 The CPU temperature source is taken from the profile you created in the GUI - this script reads its temp_source
 rather than guessing CoolerControl's internal sensor ids.
@@ -61,19 +67,22 @@ RAD_MIX_UID = "b7e24c19-5a3d-4f81-9c06-2d1b7e90a343"
 
 # Written in fan1's units: duty is a fraction of its 641..1771 RPM range, so these stay low.
 CPU_RAD_CURVE = [[40.0, 2], [50.0, 6], [60.0, 14], [70.0, 26], [80.0, 40], [90.0, 55]]
-GPU_RAD_CURVE = [[50.0, 4], [60.0, 10], [70.0, 22], [78.0, 34], [85.0, 48], [95.0, 60]]
+# The radiator pair does not ramp for the 3090 at all until 70 C.  Its fans idle at 641 RPM whatever the duty, so a
+# flat 2% below 70 C costs nothing and stops the memory's resting temperature spinning them.
+GPU_RAD_CURVE = [[45.0, 2], [70.0, 2], [78.0, 12], [85.0, 25], [92.0, 40]]
 
-# Retuned exhaust member: was [[35,32],[50,40],[60,55],[70,72],[80,90],[90,100]] - ramping from 35 C meant the
-# memory's resting temperature (~48 C just being powered) already asked for ~39%.  Now flat at the 32% floor (just
-# above fan6's 30% stall duty) up to 50 C, then it ramps: 48 C -> 32%, 62 C -> 54%, 76 C -> 82%.
-EXHAUST_CURVE_NEW = [[45.0, 32], [50.0, 32], [60.0, 50], [70.0, 72], [80.0, 88], [90.0, 98]]
+# Exhaust member, held back rather than overegged: flat at the 32% floor (just above fan6's 30% stall duty) to 50 C,
+# then a gentle climb that tops out at 75% instead of the original 100%.  Balance is achieved by asking less of the
+# three exhausts, not by pushing the intake pair harder - the case has three exhausts and one unobstructed intake, so
+# matching duty would already be negative pressure.
+EXHAUST_CURVE_NEW = [[45.0, 32], [50.0, 32], [60.0, 45], [70.0, 56], [80.0, 66], [90.0, 75]]
 
 CPU_RAD_NAME = "CPU (radiator)"
 GPU_RAD_NAME = "GPU (radiator)"
 RAD_MIX_NAME = "Radiator (CPU or VRAM)"
 
 SCENARIOS = [("idle now", None, None), ("resting (typical)", 40.0, 48.0),
-             ("GPU decoding", 57.0, 76.0), ("CPU-only pool", 72.0, 45.0)]
+             ("GPU decoding 76C", 57.0, 76.0), ("GPU hot 84C", 60.0, 84.0), ("CPU-only pool", 72.0, 45.0)]
 
 HEADER_RE = re.compile(r"^\[\[?[A-Za-z0-9_.-]+\]\]?\s*$")
 DEV_HEADER = f"[device-settings.{MB_DEVICE}]"
@@ -275,7 +284,7 @@ def predict(parsed):
             continue
         old = [[35.0, 32], [50.0, 40], [60.0, 55], [70.0, 72], [80.0, 90], [90.0, 100]]
         new = profiles[VRAM_EXHAUST_UID]["speed_profile"]
-        cells = "  ".join(f"{t:.0f}C: {curve_at(new,t):5.1f}% (was {curve_at(old,t):5.1f}%)" for t in (48, 62, 76))
+        cells = "  ".join(f"{t:.0f}C: {curve_at(new,t):5.1f}% (was {curve_at(old,t):5.1f}%)" for t in (48, 62, 76, 84))
         log(f"   {ch} exhaust member: {cells}")
 
 
