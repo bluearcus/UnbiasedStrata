@@ -620,9 +620,9 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
-    bool vram_reserve_given = false;
+    bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
     /// --vram-cap N | D:MIB,... : per-device VRAM caps (see vram_info above).  Empty = no cap.
-    std::string vram_cap;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
+    std::string vram_cap;
     /// #533 (opt-in): the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
