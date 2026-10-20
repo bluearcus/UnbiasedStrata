@@ -189,6 +189,50 @@ Then in the interface:
    exporter script is unnecessary, and plain `fancontrol` would do it too.  Hardware purchase; the exporter is the
    no-cost equivalent.
 
+## The config patch (`tools/coolercontrol/vram_profiles.py`)
+
+CoolerControl's configuration lives in `/etc/coolercontrol/config.toml` (TOML, daemon-owned; `overrides.toml` is the
+hand-editable name file).  Its API requires authentication for reads as well as writes, so the patch is applied to
+the file - under root, with the daemon stopped.  The script exists because TOML is table-scoped: the new
+`[[profiles]]` entries must land inside the profiles array and the channel assignments directly under
+`[device-settings]`, and a key in the wrong scope parses happily and does nothing.
+
+Safety, all of it exercised on a copy of the live config before first use:
+
+| Path | Result |
+| --- | --- |
+| `plan` | prints the added lines, validates the result with `tomllib`, writes nothing |
+| `apply` | refuses to run while `coolercontrold` is active (it rewrites the config on shutdown) |
+| `apply` | re-checks idempotency: a second run reports "already applied" and changes nothing |
+| backup | byte-exact copy (`config.toml.vrambak-<stamp>`, mode 0600) parsed and validated before anything is written |
+| write | the patched text is re-parsed, and the script verifies `fan5`/`fan6` resolve to the intended profile UIDs - it refuses if an assignment landed in the wrong table |
+| `coolercontrold check` | if the daemon's own validator fails, the backup is restored automatically and the script exits non-zero |
+| `--start` | if the daemon refuses to start with the new config, it rolls back, restarts the service with the old config |
+| `revert` | restores the newest backup byte-for-byte (verified: md5 identical to the original) |
+
+What the patch installs: two Graph profiles on the `3090 VRAM` File sensor, applied to **`fan5` (front bottom GPU
+intake)** and **`fan6` (top rear exhaust)** - the two headers pinned by flat BIOS curves.  Curve floors respect the
+measured stall duties (`fan5` will not start below 20%, `fan6` not below 30%).
+
+What it deliberately does **not** touch: `fan1` (AIO radiator), `fan2` (pump), `fan3` (rear exhaust) and `fan4`
+(top forward exhaust).  `fan3`/`fan4` are already at 76% on a CPU curve doing real work; a VRAM-only curve would
+drop them to 30-48% whenever the GPU is idle and regress CPU cooling.  They need Mix Profiles, and a Mix Profile
+needs a CPU-sourced Graph profile - which cannot be authored blind, because `temp_source.temp_name` is
+CoolerControl's internal sensor id and the API that lists devices is authenticated.  So: create that one profile in
+the GUI (pick the CPU sensor from the dropdown), note its uid from the config afterwards, and the mixes become
+mechanical.
+
+```bash
+sudo systemctl stop coolercontrold
+sudo python3 tools/coolercontrol/vram_profiles.py plan      # look first
+sudo python3 tools/coolercontrol/vram_profiles.py apply --start
+sudo python3 tools/coolercontrol/vram_profiles.py backups   # what to fall back to
+# undo, if anything looks wrong:
+sudo systemctl stop coolercontrold
+sudo python3 tools/coolercontrol/vram_profiles.py revert
+sudo systemctl start coolercontrold
+```
+
 ## Verification checklist
 
 1. `journalctl -u vram-sensor -n 20` → `... <- 72.0 C`, and `/run/vramsensor/vram.temp1` tracks it.
