@@ -36,7 +36,7 @@ struct Promotion {
 /// expired.  Layers with no primary-held experts are skipped: there is no ranking to compare against.
 inline int select_promotions(const float* usage, const int32_t* r0, const int32_t* r1, int64_t n_layers,
                              int64_t n_expert, const int32_t* last_forced, int32_t round, int32_t cooldown_rounds,
-                             int max_n, std::vector<Promotion>& out) {
+                             int max_n, std::vector<Promotion>& out, float min_gain = 1.5f) {
     out.clear();
     if (max_n <= 0) return 0;
     std::vector<float> held;
@@ -55,7 +55,7 @@ inline int select_promotions(const float* usage, const int32_t* r0, const int32_
         for (int64_t e = 0; e < n_expert; ++e) {
             if (p1[e] < 0 || p0[e] >= 0) continue;        // peer-held and not primary-held only
             const float heat = u[e];
-            if (heat < 2.0f || !(heat > bar) || heat < worst + 1.5f) continue;
+            if (heat < 2.0f || !(heat > bar) || heat < worst + min_gain) continue;
             const int32_t lf = last_forced[l * n_expert + e];
             if (lf != kNotResident && round - lf < cooldown_rounds) continue;
             out.push_back({heat - worst, (int32_t) l, (int32_t) e});

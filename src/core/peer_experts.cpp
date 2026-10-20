@@ -334,12 +334,12 @@ bool PeerExperts::finish(float* out, std::string& err) {
 
 // STRATA-FORK-BEGIN: the promotion pass
 bool PeerExperts::promotion_candidates(const float* usage, const int32_t* res0, int max_n,
-                                       std::vector<Promotion>& out) {
+                                       std::vector<Promotion>& out, float min_gain) {
     out.clear();
     if (!valid() || max_n <= 0) return true;
     ++adapt_round_;                     // the cooldown clock: one tick per coordination round
     select_promotions(usage, res0, res_.data(), n_layers_, n_expert_, last_forced_.data(), adapt_round_,
-                      kPromoCooldown, max_n, out);
+                      kPromoCooldown, max_n, out, min_gain);
     return true;
 }
 

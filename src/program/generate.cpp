@@ -9716,10 +9716,21 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_PEER_PROMOTE");
                 return v != nullptr && std::atoi(v) != 0;
             }();
+            // A promotion demotes a primary resident to the CPU pool, so the RATE is the whole question: a pass may
+            // take at most this many (default 2, against adapt_swaps = 96) and only when the heat margin beats this
+            // (default 3.0, against the 1.5 admission margin).  STRATA_PEER_PROMOTE_MAX / _GAIN override.
+            static const int promo_max = [] {
+                const char* v = std::getenv("STRATA_PEER_PROMOTE_MAX");
+                return v != nullptr ? std::max(1, std::atoi(v)) : 2;
+            }();
+            static const float promo_gain = [] {
+                const char* v = std::getenv("STRATA_PEER_PROMOTE_GAIN");
+                return v != nullptr ? (float) std::atof(v) : 3.0f;
+            }();
             std::vector<strata::core::Promotion> promos;
             std::vector<uint8_t> promoted;
             if (peer.valid() && promo_on) {
-                if (!peer.promotion_candidates(drive.d.usage.data(), host_res.data(), o.adapt_swaps, promos))
+                if (!peer.promotion_candidates(drive.d.usage.data(), host_res.data(), promo_max, promos, promo_gain))
                     return false;
                 promoted.assign((size_t) (g.n_layers * g.n_expert), 0);
                 for (const strata::core::Promotion& p : promos) promoted[(size_t) p.layer * g.n_expert + p.expert] = 1;

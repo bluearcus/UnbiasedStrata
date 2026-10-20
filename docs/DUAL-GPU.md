@@ -87,6 +87,22 @@ cards being VRAM means residency does not improve; only bandwidth asymmetry coul
 peer is not bandwidth-starved (`peer_ms_wait` was 0.14 ms/token). The coordinated design removed the bounce but
 not the demotion, which is why it did not recover the loss either.
 
+**The rate is the dominant variable.** The pass runs every `--adapt-every` windows (default 4) and was allowed up
+to `--adapt-swaps` (96) promotions per pass; the soak logs show it averaging ~18 per pass. Sweeping the budget at
+32K (XXS, peer on, 3 runs each) gives a clean monotone curve:
+
+| Promotions per pass | Heat margin | Decode |
+| --- | --- | --- |
+| 0 (off) | - | **101.9** |
+| 2 | 3.0 | 98.2 |
+| 8 | 2.0 | 92.1 |
+| 96 (the old default) | 1.5 | 80.9 |
+
+Each promotion is paid for by demoting a primary resident to the CPU pool, and on this rig there is no bandwidth
+gain to trade for it, so the cost is monotone in the rate and any rate is negative. `STRATA_PEER_PROMOTE_MAX`
+(default 2) and `STRATA_PEER_PROMOTE_GAIN` (default 3.0) exist for the case the mechanism was written for - a peer
+card much slower than the primary, where `peer_ms_wait` is large - not for this rig.
+
 So the mechanism is kept behind `STRATA_PEER_PROMOTE=1` (the code is small and correct, and a peer with a much
 slower card or a large `peer_ms_wait` is the case it was written for) and **off by default**. With it off, the
 fork's peer arm matches upstream's within noise and beats single-GPU by 8-11% at 4K/32K.

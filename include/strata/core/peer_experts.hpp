@@ -78,7 +78,8 @@ public:
     /// them to its candidate scan and calls evict() only for the ones it actually admits, so a promotion either
     /// happens (coordinated: the primary admits it, the peer drops it, the primary's victim becomes the peer's
     /// candidate) or costs nothing.  Host-side only; increments the round clock the cooldown uses.
-    bool promotion_candidates(const float* usage, const int32_t* res0, int max_n, std::vector<Promotion>& out);
+    bool promotion_candidates(const float* usage, const int32_t* res0, int max_n, std::vector<Promotion>& out,
+                              float min_gain = 1.5f);
     /// Drops (layer, expert) from the tier after the primary admitted it.  The slot is left for the tier's own
     /// refill, which cannot take it back (the primary holds it now).
     void evict(int64_t layer, int64_t expert);
