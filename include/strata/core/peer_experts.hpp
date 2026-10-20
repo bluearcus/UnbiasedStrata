@@ -17,6 +17,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/peer_promotion.hpp"   // STRATA-FORK: promotion candidates
 
 #include <cuda_runtime.h>
 
@@ -72,11 +73,15 @@ public:
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     // STRATA-FORK-BEGIN: the peer-to-primary promotion pass (peer_promotion.hpp) and the census accessors
-    /// Promotion pass, called BEFORE the primary's own adapt in the same round: evicts peer-held experts whose
-    /// heat ranks inside the top third of their layer's primary residents (peer_promotion.hpp), which makes them
-    /// ordinary primary candidates that round - the primary's gain-sorted machinery then pulls the deserving ones
-    /// up to the faster card.  Host-side only (a residency-table update; the copies are the primary's swaps).
-    bool nominate_for_primary(const float* usage, const int32_t* res0, int max_n, int& nominated);
+    /// Promotion candidates for the primary's own selection, computed WITHOUT evicting: peer-held experts whose
+    /// heat ranks inside the top third of their layer's primary residents (peer_promotion.hpp).  The caller feeds
+    /// them to its candidate scan and calls evict() only for the ones it actually admits, so a promotion either
+    /// happens (coordinated: the primary admits it, the peer drops it, the primary's victim becomes the peer's
+    /// candidate) or costs nothing.  Host-side only; increments the round clock the cooldown uses.
+    bool promotion_candidates(const float* usage, const int32_t* res0, int max_n, std::vector<Promotion>& out);
+    /// Drops (layer, expert) from the tier after the primary admitted it.  The slot is left for the tier's own
+    /// refill, which cannot take it back (the primary holds it now).
+    void evict(int64_t layer, int64_t expert);
     void apply_pending(bool wait);
 
     int64_t resident() const { return resident_; }

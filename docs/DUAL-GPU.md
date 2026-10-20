@@ -69,17 +69,27 @@ Notes:
   4.0 x4 slot its staging shares that link (~1.5 MB/token each way at 30% peer ownership — fine against a
   ~10 ms decode step; watch `peer_ms_wait` in `/health`).
 
-## Upward tier movement (promotion pass)
+## Upward tier movement (promotion pass) — opt-in, measured HARMFUL, default off
 
-The two VRAM tiers never exchange residency directly. Instead, each adapt round opens with a promotion pass:
-a peer-held expert whose heat ranks inside the **top third** of its layer's primary residents is evicted to CPU
-coverage, which makes it an ordinary primary candidate in the same round — and the primary's gain-sorted
-admission pulls it up to the faster card when it beats a victim there. Weights always come from the host
-source. Three guards: the nominee must also beat the layer's worst primary resident by the standard 1.5
-margin (so it is actually admitted, not stranded on the CPU), at most `adapt_swaps` nominations per round,
-and an 8-round cooldown before re-nomination. `peer_nominated` in `/health` counts the cumulative upward
-moves. Net effect: the fast card converges back toward holding the hottest experts even when the conversation
-drifts off-profile, without a restart.
+The promotion pass moved peer-held experts to the primary when their heat ranked in the top third of that
+layer's primary residents. Two designs were built and measured at 262K, peer on, 3-run medians:
+
+| Design | XXS 1K / 4K / 32K | S 1K / 4K / 32K |
+| --- | --- | --- |
+| Evict-first (evict, then let the primary's selection decide; losers bounce back) | 108.8 / 84.6 / 84.2 | 87.7 / 68.0 / 67.9 |
+| **Coordinated** (nominate without evicting; only the admitted ones leave the peer) | 100.1 / 86.1 / 81.6 | 82.7 / 68.1 / 68.7 |
+| **Disabled** (upstream behaviour) | **106.5 / 99.0 / 100.8** | **96.7 / 86.8 / 80.2** |
+| Upstream engine, same settings (reference) | 105.7 / 99.2 / 106.9 | 94.0 / 83.1 / 84.9 |
+
+**Why it cannot pay here, in hindsight:** a promotion is a *lateral* move - the expert is already resident in
+VRAM, merely on the slower card - and it is paid for by **demoting a primary resident to the CPU pool**. Both
+cards being VRAM means residency does not improve; only bandwidth asymmetry could justify it, and on this rig the
+peer is not bandwidth-starved (`peer_ms_wait` was 0.14 ms/token). The coordinated design removed the bounce but
+not the demotion, which is why it did not recover the loss either.
+
+So the mechanism is kept behind `STRATA_PEER_PROMOTE=1` (the code is small and correct, and a peer with a much
+slower card or a large `peer_ms_wait` is the case it was written for) and **off by default**. With it off, the
+fork's peer arm matches upstream's within noise and beats single-GPU by 8-11% at 4K/32K.
 
 ## Observability
 

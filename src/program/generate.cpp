@@ -9704,11 +9704,25 @@ int main(int argc, char** argv) {
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
-            // STRATA-FORK-BEGIN: upward tier move first (peer_promotion.hpp), so the primary's selection below
-            // sees the nominations as ordinary candidates
-            if (peer.valid()) {
-                int nev = 0;
-                if (!peer.nominate_for_primary(drive.d.usage.data(), host_res.data(), o.adapt_swaps, nev)) return false;
+            // STRATA-FORK-BEGIN: coordinated promotion.  The candidates are computed, NOT evicted: the primary's
+            // own selection below decides, and only the ones it admits leave the peer, so nothing bounces between
+            // the cards.  The primary's victim then becomes an ordinary CPU miss, which the peer's own refill may
+            // take - the demotion half of the same swap.
+            // STRATA-FORK: opt-in, default OFF.  A promotion is a LATERAL move - the expert is already in VRAM, on
+            // the slower card - so it only pays when that card is bandwidth-starved (a large peer_ms_wait).  It also
+            // demotes a primary resident to the CPU pool, which costs real time.  Measured on this rig: peer with
+            // promotion is 4-22% slower than peer without it, and slower than no peer at all.
+            static const bool promo_on = [] {
+                const char* v = std::getenv("STRATA_PEER_PROMOTE");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            std::vector<strata::core::Promotion> promos;
+            std::vector<uint8_t> promoted;
+            if (peer.valid() && promo_on) {
+                if (!peer.promotion_candidates(drive.d.usage.data(), host_res.data(), o.adapt_swaps, promos))
+                    return false;
+                promoted.assign((size_t) (g.n_layers * g.n_expert), 0);
+                for (const strata::core::Promotion& p : promos) promoted[(size_t) p.layer * g.n_expert + p.expert] = 1;
             }
             // STRATA-FORK-END
             struct Swap { float gain; int32_t layer, in, out; };
@@ -9720,7 +9734,12 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) {
+                        // STRATA-FORK: a promotion candidate is peer-held but admissible here - that is the point
+                        const bool promo = !promoted.empty() && promoted[(size_t) l * g.n_expert + e] != 0;
+                        if (u[e] >= 2.0f && (promo || !(peer.valid() && peer.has(l, e))) &&
+                            !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e);
+                    }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -9753,6 +9772,12 @@ int main(int argc, char** argv) {
             };
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
+            // STRATA-FORK-BEGIN: the promotion half of the swap - only the candidates the primary actually admitted
+            // leave the peer (the copies for them are already queued above)
+            if (!promoted.empty())
+                for (const Swap& s : swaps)
+                    if (promoted[(size_t) s.layer * g.n_expert + s.in]) peer.evict(s.layer, s.in);
+            // STRATA-FORK-END
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)

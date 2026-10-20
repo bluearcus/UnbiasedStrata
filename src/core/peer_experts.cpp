@@ -333,22 +333,23 @@ bool PeerExperts::finish(float* out, std::string& err) {
 }
 
 // STRATA-FORK-BEGIN: the promotion pass
-bool PeerExperts::nominate_for_primary(const float* usage, const int32_t* res0, int max_n, int& nominated) {
-    nominated = 0;
+bool PeerExperts::promotion_candidates(const float* usage, const int32_t* res0, int max_n,
+                                       std::vector<Promotion>& out) {
+    out.clear();
     if (!valid() || max_n <= 0) return true;
-    ++adapt_round_;
-    std::vector<Promotion> promos;
+    ++adapt_round_;                     // the cooldown clock: one tick per coordination round
     select_promotions(usage, res0, res_.data(), n_layers_, n_expert_, last_forced_.data(), adapt_round_,
-                      kPromoCooldown, max_n, promos);
-    for (const Promotion& p : promos) {
-        const size_t i = (size_t) p.layer * n_expert_ + p.expert;
-        if (res_[i] < 0) continue;
-        res_[i] = kNotResident;     // evicted now: the CPU computes it meanwhile, the primary may take it up
-        last_forced_[i] = adapt_round_;
-        ++nominated;
-    }
-    nominated_ += nominated;
+                      kPromoCooldown, max_n, out);
     return true;
+}
+
+void PeerExperts::evict(int64_t layer, int64_t expert) {
+    if (!valid() || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return;
+    const size_t i = (size_t) layer * n_expert_ + expert;
+    if (res_[i] < 0) return;
+    res_[i] = kNotResident;             // the primary holds it now; the slot is left for this tier's own refill
+    last_forced_[i] = adapt_round_;
+    ++nominated_;
 }
 
 // STRATA-FORK-END
