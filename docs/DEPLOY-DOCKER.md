@@ -154,3 +154,25 @@ Two further choices to make explicit:
 3. Bring it up; run the validation checklist end to end.
 4. Add the `s` profile and re-run items 3-5 for it.
 5. Record the deployed configuration in `docs/SERVICE.md` (replacing the systemd framing) and note the `--gpus` host bug.
+
+## 8. As built — results of the validation checklist
+
+| Step | Result |
+| --- | --- |
+| `docker compose build` | **~19 min**, image 5.35 GB (devel stage discarded) |
+| `up -d`, logs | shim: `peer GPU 1, p2p no, reserve 2500 MiB`; engine: `peer GPU 1: 5324 experts, 8.60 GiB … 14731 of 24576 on the GPUs`; then `listening on http://0.0.0.0:8080` |
+| health | healthy; tiers `vram_slots 9407`, `peer_slots 5326`, `peer_p2p false`, ctx 262144 |
+| chat + throughput | 385-token streaming reply: **108.1 tok/s** decode (host mean 98.1), TTFT 1.16 s |
+| GPU mapping | container device 0 = RTX 3090 (23,780 MiB used), device 1 = RTX 4070 (9,582 MiB incl. desktop) |
+| `compose restart` | healthy again in **32 s** (page cache warm); slots unchanged |
+| quant override (`STRATA_MODEL`/`STRATA_PACK` = IQ3_S) | recreated in place, healthy after 36 s, slots 7,869 + 4,518, **97.9 tok/s** decode; back to XXS with plain `up -d` |
+| stop with a request in flight | VRAM released (3090 2 MiB, 4070 254 MiB), no orphaned process; container exit **134** (`terminate called without an active exception`) |
+| idle stop | exit **1** — by design: the front end's supervisor returns non-zero when the engine goes away, so a service manager restarts both |
+| reboot | not performed (would interrupt the user's session); `restart: unless-stopped` is set and both stop paths are clean of orphans |
+
+Two findings for the record:
+
+* **Exit codes are intentionally non-zero.** `frontend/main.cpp` returns `engine_died ? 1 : 0`, so a stop is not a
+  clean `0`. `restart: unless-stopped` distinguishes engine failure (restart) from an explicit stop (stay down).
+* **Exit 134 on the in-flight cancel path** is a `std::terminate` during teardown, after VRAM is released. Worth
+  reporting upstream rather than patching here - it cannot leave a half-held card.
