@@ -72,3 +72,6 @@ dist-hip/
 
 # macOS Finder metadata
 .DS_Store
+
+# Deployment secrets and per-host settings (STRATA_API_KEY, STRATA_BIND_ADDR).
+.env

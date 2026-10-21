@@ -45,7 +45,9 @@ services:
       # window (#2065); it costs ~80 expert slots and nothing measurable in decode.
       STRATA_EXTRA_ENGINE_ARGS: ${STRATA_EXTRA_ENGINE_ARGS:---conversation-cache-mib 8192 --conversation-cache-min-free-mib 2048 --vram-reserve-mib 832}
     ports:
-      - "127.0.0.1:${STRATA_PUBLISH_PORT:-8080}:8080"
+      # Loopback by default so a fresh clone never opens a port; set STRATA_BIND_ADDR=0.0.0.0 (a .env does it here)
+      # to publish on the LAN, and set STRATA_API_KEY with it: everything except /health then needs the key.
+      - "${STRATA_BIND_ADDR:-127.0.0.1}:${STRATA_PUBLISH_PORT:-8080}:8080"
     volumes:
       - /home/mike/models:/models:ro
     # CUDA host allocations and the 256K-context buffers want real shared memory, not the 64 MB default.
