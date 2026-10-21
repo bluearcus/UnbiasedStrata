@@ -546,7 +546,20 @@ def cmd_retune(a):
     return 0
 
 
-def build_smooth(text, parsed, sensor_id):
+def resolve_profile(parsed, sel):
+    """Find a profile by exact name or full/prefix uid.  Ambiguity is an error, not a coin toss."""
+    profs = parsed.get("profiles", [])
+    hits = [p for p in profs if p.get("name") == sel or p.get("uid") == sel
+            or (len(sel) >= 8 and (p.get("uid") or "").startswith(sel))]
+    if not hits:
+        names = ", ".join(sorted({p.get("name", "?") for p in profs}))
+        sys.exit(f"REFUSED: no profile matching {sel!r}.  Profiles: {names}")
+    if len(hits) > 1:
+        sys.exit(f"REFUSED: {sel!r} matches {len(hits)} profiles: {[p.get('name') for p in hits]}")
+    return hits[0]
+
+
+def build_smooth(text, parsed, sensor_id, profile_sel):
     """Point the CPU member of the radiator mix at a smoothed custom sensor instead of the raw package temperature.
 
     Why: the raw Package id 0 sensor bounces ~13 C per second at idle as cores park and boost, and a graph curve turns
@@ -566,8 +579,12 @@ def build_smooth(text, parsed, sensor_id):
         sys.exit(f"REFUSED: {sensor_id} is cs_type={sens.get('cs_type')!r}; this only points at a smoothing sensor")
     window = sens.get("time_window_seconds")
     profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
-    if CPU_RAD_UID not in profiles:
-        sys.exit("not applied yet: CPU (radiator) is absent.  Run 'apply' first.")
+    target = resolve_profile(parsed, profile_sel)
+    target_uid = target.get("uid")
+    cur = target.get("temp_source") or {}
+    if cur.get("temp_name") == sensor_id:
+        log(f"  {target.get('name')!r} already reads {sensor_id} - nothing to do")
+        return text
     dev = next((d for d in parsed.get("devices", {}) if d.startswith("19e0")), None)
     if dev is None:
         sys.exit("REFUSED: cannot identify the custom-sensors device uid")
@@ -581,16 +598,16 @@ def build_smooth(text, parsed, sensor_id):
             start, uid = i, None
         elif start is not None and line.startswith("uid = "):
             uid = line.split("=", 1)[1].strip().strip('"')
-        if uid == CPU_RAD_UID and line.startswith("temp_source = "):
-            log(f"  CPU (radiator) temp_source: {line.strip()}")
+        if uid == target_uid and line.startswith("temp_source = "):
+            log(f"  {target.get('name')} temp_source: {line.strip()}")
             log(f"      -> {want}")
             lines[i] = want
             changed = True
             uid = None
     if not changed:
-        sys.exit(f"could not find the temp_source line of {CPU_RAD_UID}")
+        sys.exit(f"could not find the temp_source line of {target_uid}")
     log(f"  smoothing sensor {sensor_id}: cs_type={sens.get('cs_type')} window={window}s "
-        f"(~{3 * (window or 0)}s to fully follow a sustained change)")
+        f"(measured on this box: 90% of a step's rise in ~16s at a 20s window)")
     return "\n".join(lines)
 
 
@@ -600,9 +617,10 @@ def cmd_smooth(a):
         sys.exit("coolercontrold is RUNNING - stop it first: sudo systemctl stop coolercontrold")
     text = read_config(a.config)
     parsed = tomllib.loads(text)
-    patched = build_smooth(text, parsed, a.sensor)
+    patched = build_smooth(text, parsed, a.sensor, a.profile)
     after = tomllib.loads(patched)
-    got = next(p for p in after["profiles"] if p.get("uid") == CPU_RAD_UID)["temp_source"]
+    sel = resolve_profile(after, a.profile)
+    got = sel["temp_source"]
     if got.get("temp_name") != a.sensor:
         sys.exit(f"REFUSED: the patched config does not read back with {a.sensor} as the CPU source: {got}")
     if a.dry_run:
@@ -664,7 +682,8 @@ def main():
     ap.add_argument("--config", default=CONFIG)
     ap.add_argument("--preset", default="steep", choices=sorted(CPU_CURVES),
                     help="with retune: which CPU curve shape to install")
-    ap.add_argument("--sensor", default="", help="with smooth: the custom sensor id to read for the CPU member")
+    ap.add_argument("--sensor", default="", help="with smooth: the custom sensor id to read")
+    ap.add_argument("--profile", default=CPU_RAD_NAME, help="with smooth: profile name or uid to repoint (default the radiator CPU member)")
     ap.add_argument("--dry-run", action="store_true", help="with retune: print the change, write nothing")
     ap.add_argument("--start", action="store_true")
     ap.add_argument("--show", action="store_true")
