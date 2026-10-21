@@ -70,7 +70,22 @@ RAD_MIX_UID = "b7e24c19-5a3d-4f81-9c06-2d1b7e90a343"
 # fan1's calibration (641 RPM start, so duty is a fraction of its RPM range) is only ~958 of 1771 RPM: a CPU at 95 C
 # could not spin the fans that dump its heat past half.  That is a safety defect, not a taste question, and the guard
 # in check_cpu_ceiling() now refuses a curve that reintroduces it.  This one is at 100% by 75 C.
-CPU_RAD_CURVE = [[40.0, 2], [45.0, 10], [50.0, 22], [55.0, 38], [60.0, 55], [65.0, 72], [70.0, 90], [75.0, 100], [95.0, 100]]
+# The radiator pair's CPU curve, in two shapes.  Both reach 100% by 75 C - that part is not negotiable, and
+# check_cpu_ceiling() enforces it.
+#
+#   steep   what shipped after the 55%-ceiling defect was fixed.  Its slope in the 50-60 C band is ~3 points/degree,
+#           which was only ever needed because the input was a sensor bouncing 13 C per second.
+#   gentle  a higher floor and an earlier start, so the idle mean sits on a flatter part of the curve.  ~0.9 points/
+#           degree at 40-48 C.  Use it once the input is smoothed; against the raw sensor its lower slope just means
+#           less amplitude on the same 3 s oscillation.
+CPU_CURVES = {
+    "steep":  [[40.0, 2], [45.0, 10], [50.0, 22], [55.0, 38], [60.0, 55], [65.0, 72], [70.0, 90],
+               [75.0, 100], [95.0, 100]],
+    "gentle": [[35.0, 15], [40.0, 15], [48.0, 22], [55.0, 34], [62.0, 52], [68.0, 72], [72.0, 88],
+               [75.0, 100], [95.0, 100]],
+}
+CPU_RAD_PRESET = "steep"
+CPU_RAD_CURVE = CPU_CURVES[CPU_RAD_PRESET]
 # The radiator pair does not ramp for the 3090 at all until 70 C.  Its fans idle at 641 RPM whatever the duty, so a
 # flat 2% below 70 C costs nothing and stops the memory's resting temperature spinning them.
 GPU_RAD_CURVE = [[45.0, 2], [70.0, 2], [78.0, 12], [85.0, 25], [92.0, 40]]
@@ -274,7 +289,7 @@ def check_cpu_ceiling(curve):
     log(f"CPU ceiling check: 100% by 75 C ({curve_at(curve, 75.0):.0f}% at 75 C, {top:.0f}% maximum)")
 
 
-def build_retune(text, parsed):
+def build_retune(text, parsed, a_preset="steep"):
     """Rewrite the member curves of an already-applied radiator mix, touching those two lines and nothing else.
 
     The apply path refuses to run twice, and reverting first would put fan1 back on the shared case-fan mix for the
@@ -284,11 +299,12 @@ def build_retune(text, parsed):
     table (so a comment stays with what it describes), which means re-joining it reflows those blank lines.  Byte-exact
     elsewhere is worth more here than reusing the helper, so this finds each table by its uid and rewrites one line.
     """
-    check_cpu_ceiling(CPU_RAD_CURVE)
+    cpu_curve = CPU_CURVES[a_preset]
+    check_cpu_ceiling(cpu_curve)
     profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
     if RAD_MIX_UID not in profiles:
         sys.exit("not applied yet: the radiator mix is absent.  Run 'apply' instead of 'retune'.")
-    want = {CPU_RAD_UID: CPU_RAD_CURVE, GPU_RAD_UID: GPU_RAD_CURVE}
+    want = {CPU_RAD_UID: cpu_curve, GPU_RAD_UID: GPU_RAD_CURVE}
 
     lines = text.split("\n")
     done = {}
@@ -490,7 +506,7 @@ def cmd_retune(a):
         parsed = tomllib.loads(text)
     except Exception as e:
         sys.exit(f"the CURRENT config does not parse ({e}) - look before editing anything")
-    patched = build_retune(text, parsed)
+    patched = build_retune(text, parsed, a.preset)
     print_curves(patched)
     if a.dry_run:
         log("dry run: nothing written")
@@ -506,7 +522,7 @@ def cmd_retune(a):
         shutil.copy2(bak, a.config)
         return 1
     got = {p.get("uid"): p.get("speed_profile") for p in after.get("profiles", [])}
-    if got.get(CPU_RAD_UID) != CPU_RAD_CURVE or got.get(GPU_RAD_UID) != GPU_RAD_CURVE:
+    if got.get(CPU_RAD_UID) != CPU_CURVES[a.preset] or got.get(GPU_RAD_UID) != GPU_RAD_CURVE:
         log("the written curves do not read back as intended - rolling back")
         shutil.copy2(bak, a.config)
         return 1
@@ -616,7 +632,7 @@ def cmd_smooth(a):
     return 0
 
 
-def print_curves(text):
+def print_curves(text, preset="steep"):
     """What the two radiator curves mean at the temperatures this CPU actually reaches."""
     parsed = tomllib.loads(text)
     profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
@@ -646,6 +662,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("command", choices=["plan", "apply", "retune", "smooth", "revert", "backups"])
     ap.add_argument("--config", default=CONFIG)
+    ap.add_argument("--preset", default="steep", choices=sorted(CPU_CURVES),
+                    help="with retune: which CPU curve shape to install")
     ap.add_argument("--sensor", default="", help="with smooth: the custom sensor id to read for the CPU member")
     ap.add_argument("--dry-run", action="store_true", help="with retune: print the change, write nothing")
     ap.add_argument("--start", action="store_true")
