@@ -595,6 +595,44 @@ Worth still testing, cheaply and separately, whether 40-series accepts VRAM at a
 contribution can be a *local* curve with the cross-card boost layered on top, or whether both temperatures have to be
 computed in the agent.
 
+### The radiator pair oscillated, and the fix was filtering the sensor
+
+Found by accident while checking the CPU half of the curve.  At **no load**, sampled once a second, the CPU package
+sensor swung 13 C (47..60) and reversed direction 26 times in 45 s - a ~3 s oscillation.  With a curve carrying 12-17
+duty points per degree, that jitter became visible fan hunting:
+
+| | raw sensor | 20 s EMA |
+| --- | --- | --- |
+| pwm turning points in 45 s | 24 | **9** |
+| mean swing between turns | 10.1 duty points | **1.6** |
+| largest single swing | 20 points | **3** |
+
+Nothing was damping it: `[functions]` held only the `Identity` default on every channel.  CoolerControl's own answer is a
+custom sensor of `cs_type ExponentialMovingAvg` (or `TimeAverage`), window 1-300 s; the smoothed CPU package temperature
+was created in the GUI and `CPU (radiator)` was repointed at it (`ccrad smooth --sensor ...`).  The GPU member and the
+case-fan mix still read their raw sources.
+
+**Measured settling, correcting the daemon's own tooltip.**  The UI claims an EMA "takes roughly 3x the window length to
+fully follow a sustained change".  A step load (100 s of `matrixprod`) with the smoothed value recovered by inverting the
+curve gave: 50% of the rise at **+6 s**, 90% at **+16 s**, for a 20 s window - roughly 1x, not 3x.  Two caveats: the
+estimate is coarse (inverting the curve gives about 0.5 C) and it **clips at 100% duty / 75 C**, so 16 s is a floor on
+the true 90% time.  Either way it is not 60 s, and 20 s does not need shortening.
+
+The same run re-checked the safety property the earlier 55%-ceiling defect was fixed for:
+
+| t | raw CPU | duty |
+| --- | --- | --- |
+| +21 s | 63 C | 67% |
+| +33 s | 75 C | 90% |
+| +41 s | 75 C | **100% (1771 RPM)** |
+| +57 s | 80 C | 100% |
+
+`stress-ng --cpu 20 --cpu-method matrixprod`, 100 s, peak 80 C.  The pair reaches full speed ~18 s after the load starts
+and holds the CPU at 75-80 C.  Before the ceiling fix it could not exceed 55% duty at any temperature.
+
+Note: `stress-ng --cpu-method matrix` is **not** a valid method on 0.19 (use `matrixprod` or `all`); the first attempt
+silently loaded nothing, which is how the oscillation was spotted in the first place.
+
 ### Which memory chip runs hottest
 
 Per-chip VRAM sensors are exposed through NVAPI (`lact cli stats`), 24 of them: 12 chips x Front/Back.  Steady-state
