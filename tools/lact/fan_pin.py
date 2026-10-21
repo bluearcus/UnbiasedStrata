@@ -25,6 +25,7 @@ USAGE (root)
   sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py pin --gpu 3090 --speed 0.35
   sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py restore
   sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py restore --last
+  sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py curve --gpu 3090 --preset moderate
 """
 import argparse
 import copy
@@ -40,6 +41,18 @@ except ImportError:
     sys.exit("needs python3-yaml (sudo apt install python3-yaml)")
 
 CONFIG = "/etc/lact/config.yaml"
+
+# Fan curves in EDGE-temperature units, because on 30-series the BIOS fan API accepts no other curve source; VRAM and
+# per-chip sensors are readable but not selectable.  Measured anchors: idle 26-29 C, desktop 40-45 C, sustained decode
+# 49-57 C, and edge SATURATES at 56-57 C under load - so the only band a curve can act in is ~45-58 C.
+CURVES = {
+    # what is live now, written in VRAM units and therefore never reaching its upper half
+    "now": {40: 0.30, 50: 0.40, 60: 0.55, 70: 0.75, 80: 1.00},
+    # same 30% floor so idling stays silent, ~78% at the 57 C plateau
+    "moderate": {40: 0.30, 45: 0.35, 48: 0.45, 51: 0.55, 54: 0.65, 57: 0.78, 60: 1.00},
+    # summer setting: ~88% at the plateau, still flat at the floor below 40 C
+    "summer": {40: 0.30, 45: 0.38, 48: 0.50, 51: 0.62, 54: 0.75, 57: 0.88, 60: 1.00},
+}
 BACKUP_GLOB = "config.yaml.pinbak-*"
 GPU_4070 = "10DE:2786-1043:89BB-0000:65:00.0"
 GPU_3090 = "10DE:2204-1569:2204-0000:17:00.0"
@@ -122,6 +135,35 @@ def unchanged_others(before, after, target):
     return True
 
 
+def curve_at(pts, t):
+    """Evaluate a sparse curve at temperature t, clamped at both ends."""
+    pts = sorted(pts.items()) if isinstance(pts, dict) else pts
+    if t <= pts[0][0]:
+        return pts[0][1]
+    for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+        if t <= t1:
+            return v0 + (t - t0) / (t1 - t0) * (v1 - v0)
+    return pts[-1][1]
+
+
+def build_curve(cfg, target, preset):
+    if target not in (cfg.get("gpus") or {}):
+        sys.exit(f"{target} is not in {CONFIG}")
+    other = next((u for u in TARGETS.values() if u != target), None)
+    out = copy.deepcopy(cfg)
+    g = out["gpus"][target]
+    g["fan_control_enabled"] = True
+    fcs = g.setdefault("fan_control_settings", {})
+    fcs["mode"] = "curve"
+    fcs["temperature_key"] = "edge"
+    fcs.setdefault("interval_ms", 1000)
+    fcs.setdefault("change_threshold", 2)
+    fcs.setdefault("auto_threshold", 0)
+    fcs.setdefault("spindown_delay_ms", 8000)
+    fcs["curve"] = dict(CURVES[preset])
+    return out
+
+
 def restart():
     r = subprocess.run(["systemctl", "restart", SERVICE], capture_output=True, text=True)
     if r.returncode != 0:
@@ -201,6 +243,51 @@ def cmd_pin(a):
     return 0
 
 
+def cmd_curve(a):
+    cfg = load()
+    target = resolve_target(a.gpu)
+    out = build_curve(cfg, target, a.preset)
+    cur = (cfg["gpus"][target].get("fan_control_settings") or {})
+    log(f"{a.gpu}: curve {cur.get('curve')} key={cur.get('temperature_key')!r}")
+    log(f"  -> preset {a.preset!r}: {CURVES[a.preset]} key='edge'")
+    # show what actually changes at the temperatures this card really occupies
+    for t in (27, 43, 49, 53, 57):
+        before = curve_at(cur.get("curve") or {40: 0.3}, t) * 100
+        after = curve_at(CURVES[a.preset], t) * 100
+        log(f"   edge {t:2d}C: {before:5.0f}% -> {after:5.0f}%")
+    if a.dry_run:
+        if not unchanged_others(cfg, out, target):
+            return 1
+        log("dry run: nothing written")
+        return 0
+    if not unchanged_others(cfg, out, target):
+        return 1
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak = f"{CONFIG}.curvebak-{stamp}"
+    original = open(CONFIG, encoding="utf-8").read()
+    open(bak, "w", encoding="utf-8").write(original)
+    os.chmod(bak, 0o600)
+    yaml.safe_load(open(bak, encoding="utf-8"))
+    log(f"backup written and validated: {bak}")
+    try:
+        open(CONFIG, "w", encoding="utf-8").write(yaml.safe_dump(out, sort_keys=False))
+        yaml.safe_load(open(CONFIG, encoding="utf-8"))
+    except Exception as e:
+        log(f"write failed ({e}); restoring")
+        open(CONFIG, "w", encoding="utf-8").write(original)
+        return 1
+    if not restart():
+        log("daemon will not start with the new curve - restoring the backup")
+        open(CONFIG, "w", encoding="utf-8").write(original)
+        restart()
+        return 1
+    log(f"{a.gpu} curve set to preset {a.preset!r}, key=edge")
+    verify_fan(target)
+    log("\nverify it is really edge-keyed and responding, under load:")
+    log(f"  python3 {os.path.dirname(os.path.abspath(__file__))}/which_sensor.py --gpu {a.gpu} --seconds 120")
+    return 0
+
+
 def cmd_restore(a):
     bks = backups()
     if not bks:
@@ -218,7 +305,9 @@ def cmd_restore(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["status", "pin", "restore"])
+    ap.add_argument("command", choices=["status", "pin", "curve", "restore"])
+    ap.add_argument("--preset", default="moderate", choices=sorted(CURVES),
+                    help="with curve: which edge-unit preset to install")
     ap.add_argument("--gpu", default="4070", help="3090, 4070, or a full PCI id (default 4070)")
     ap.add_argument("--speed", type=float, default=0.80, help="static fan speed, 0.20-1.00 (default 0.80)")
     ap.add_argument("--dry-run", action="store_true")
@@ -226,7 +315,7 @@ def main():
     a = ap.parse_args()
     if a.speed < 0.2 or a.speed > 1.0:
         sys.exit("--speed must be between 0.20 and 1.00")
-    return {"status": cmd_status, "pin": cmd_pin, "restore": cmd_restore}[a.command](a)
+    return {"status": cmd_status, "pin": cmd_pin, "curve": cmd_curve, "restore": cmd_restore}[a.command](a)
 
 
 if __name__ == "__main__":
