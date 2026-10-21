@@ -27,6 +27,8 @@ the prose further down is background.
 | O7 | Calibrate `fan1` — **done**: starts spinning at **0% duty**, max **1771 RPM**, so it cannot be parked | you, GUI | closed |
 | O8 | `fan1` under automatic control — **done**, but on its own profiles, not the shared mix (see "Radiator pair and exhaust balance"). Mean exhaust speed fell 15-21% for a mean VRAM change of **-0.5 C** | assistant | closed |
 | O9 | **4070 as a backplate blower** — **done, it works**: pinned to 80% static (2715 RPM) the 3090's VRAM settles **2.4 C lower** (76.2 → 73.8 C) and peaks 4 C lower, with every case fan and the 3090's own fan *slower*. Detail and caveats below | assistant | closed, see "O9" |
+| O11 | **The 3090's own fan curve may not be keyed on VRAM at all.**  Under sustained load the card's fans track `curve(edge)` to within 1-2 points and `curve(vram)` not at all: 47% actual against a predicted 79%.  Either LACT is keying on the wrong sensor, or it is not driving that card and the BIOS is.  Settle it with one command: `fan_pin.py pin --gpu 3090 --speed 0.35` — if `nvidia-smi` then reports 35%, LACT is in control and only the key is wrong; if the fan ignores it, every curve on that card is decoration | you, one root command | O9 follow-up |
+| O12 | **Summer plan**: rather than the 4070 at 80% (which was unacceptably loud), a steeper curve on the 3090 itself — noted from your listening test, to be settled *after* O11, since the useful curve depends on which sensor is actually driving that fan | you decide | O11 |
 | O10 | **Decide how the 4070's boost should be triggered.** Constant 80% is too loud for a card that is otherwise silent, and LACT can only key a card's curve on *its own* sensors, so this needs cross-card logic (a small daemon that reads the 3090's VRAM temp and pins/drops the 4070). Not started by design: it needs your call on the noise policy. Also unmeasured: **where the knee is** — 80% was picked arbitrarily, and a 40/55/70% sweep would find the cheapest speed that still helps | you decide | O9 measured |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
 | O4 | Create one **CPU-sourced Graph profile** — **done**: `CPU temp profile`, source `Package id 0` on `coretemp` (verified it is not the NVMe `Composite` sensor, which also exposes `temp1`) | you, GUI | closed |
@@ -376,7 +378,7 @@ ratio is only comparable from now on.
 
 The 4070 sits half a slot above the 3090 and both cards intake from underneath, so at rest the 4070's fans sit at
 their VBIOS 30% (1300 RPM) while 67 W of idle card leaves a warm blanket on the 3090's backplate — the 3090's
-hottest, least-cooled surface.  Pinned to 80% static (2715 RPM) through LACT (`tools/lact/pin4070.py`), that card
+hottest, least-cooled surface.  Pinned to 80% static (2715 RPM) through LACT (`tools/lact/fan_pin.py`), that card
 becomes a free blower aimed at exactly the right place.
 
 **The mechanism is real, measured directly.**  While the 3090 decoded, the worst back-side memory chip ran **74 C
@@ -424,6 +426,40 @@ is the only thing its config can express, and constant 2715 RPM for a card that 
 default.  The useful version is conditional — boost the 4070 only while the 3090's VRAM is above ~65 C and the 4070
 is idle — which needs a small daemon reading `/run/vramsensor/vram.temp1` and driving the 4070 through LACT.
 Recorded as **O10**; not built, because it is a noise-policy decision before it is a coding one.
+
+### O11: is the 3090's own fan curve doing anything?
+
+Asked for a steeper curve on the 3090 as the summer answer to the 4070's noise, the obvious prerequisite is knowing what
+those fans are currently following.  They are not following VRAM.  Read off a sustained run, alongside the curve
+`{40:0.30, 50:0.40, 60:0.55, 70:0.75, 80:1.0}` evaluated at each of the two candidate sensors:
+
+| VRAM | edge | reported fan | curve(vram) says | curve(edge) says |
+| --- | --- | --- | --- | --- |
+| 60 C | 51 C | 38 % | 55 % | 42 % |
+| 64 C | 53 C | 43 % | 63 % | 44 % |
+| 68 C | 55 C | 44 % | 71 % | 48 % |
+| 70 C | 55 C | 47 % | 75 % | 48 % |
+| 74 C | 57 C | 48 % | **85 %** | **50 %** |
+
+Mean over every sample at or above 65 C VRAM: **fan 47 %, curve(edge) 49 %, curve(vram) 79 %.**  The edge column is a
+near-exact match across the whole ramp, which is not something a coincidence does.
+
+Two possible explanations, and they matter differently:
+
+1. **LACT is applying the curve but keying on the wrong sensor** — `temperature_key: vram` is being ignored or falling
+   back to edge/default.  Fix: rewrite the curve in edge units, or find the sensor key this LACT build accepts.
+2. **LACT is not driving this card's fan at all**, and the two curves above merely resemble each other by luck (a
+   Palit 3090 BIOS ramps to roughly 48 % at 57 C edge, which is plausible).  Fix: nothing in LACT will help until that
+   is addressed.
+
+The discriminator is a static pin, which no curve can imitate — `fan_pin.py pin --gpu 3090 --speed 0.35` and read
+`nvidia-smi`.  Not run yet; it needs one root command, and it is worth doing before touching any 3090 curve because it
+says which of the two problems we actually have.
+
+**Consequence for the summer plan (O12).**  If explanation 1 holds, the honest headroom is larger than it looks: the
+card is sitting at ~48 % fan with VRAM at 74 C, and a curve keyed to VRAM would be asking for 85 % there.  Somewhere
+between those is the quiet setting that buys the degrees — and it should be *measured* by stepping the fan and reading
+VRAM, not inferred from the curve, because the curve has just been shown not to mean what we thought.
 
 ### The mixes (`tools/coolercontrol/mix_profiles.py`) — applied 2026-10-20
 
