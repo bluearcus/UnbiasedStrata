@@ -595,6 +595,31 @@ Worth still testing, cheaply and separately, whether 40-series accepts VRAM at a
 contribution can be a *local* curve with the cross-card boost layered on top, or whether both temperatures have to be
 computed in the agent.
 
+### The fan calibration is optimistic under the filter
+
+`fan1` reads **1700-1744 RPM at 100 % duty**, against the calibration's 1771 maximum.  The calibration was measured with
+the case front and filter off, so it grants the fan a few hundred RPM it cannot actually reach with the intake
+restricted.  Practically: "100 % duty" is ~98 % of real speed, and any projection that quotes 1771 RPM at full duty is
+about 2 % optimistic.  Not worth recalibrating - redo it if the front is ever off for another reason, so the number
+reflects the machine as it runs.
+
+### Curve shapes, and the decision to allow an 80 C ceiling
+
+`CC`'s CPU curve exists in three shapes; the ceiling is the safety-relevant parameter and is checked, not assumed.
+
+| preset | shape | ceiling | note |
+| --- | --- | --- | --- |
+| `steep` | 2/10/22/38/55/72/90/100 at 40..75 | **75 C** | what shipped after the 55 %-ceiling defect |
+| `gentle` | 15/15/22/34/52/72/88/100 | 75 C | higher floor, half the slope in the idle band; steeper than `steep` at 68-75 because the endpoint did not move |
+| `top80` | 2/10/22/38/55/70/80/90/100 at 40..80 | **80 C** | the top end eased: 80 % at 70 C instead of 90 %, full speed at 80 C |
+
+`check_cpu_ceiling()` refuses any curve that does not reach 100 %, and refuses a ceiling other than 75 C or an explicitly
+accepted 80 C.  Accepting 80 C rests on measurement rather than taste: two minutes of all-core `matrixprod` held
+**77-81 C at 4300 MHz** with the fan already at 100 %, so there is roughly 5 C of headroom above the observed peak
+before throttling, and the curve still reaches full speed at the temperature the CPU actually reaches under load.  The
+default stays 75 C, and a preset cannot raise its own ceiling silently - `PRESET_CEILING` ties each shape to the ceiling
+its guard checks.
+
 ### The radiator pair oscillated, and the fix was filtering the sensor
 
 Found by accident while checking the CPU half of the curve.  At **no load**, sampled once a second, the CPU package

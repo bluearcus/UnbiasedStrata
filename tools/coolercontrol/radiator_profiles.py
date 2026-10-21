@@ -83,7 +83,16 @@ CPU_CURVES = {
                [75.0, 100], [95.0, 100]],
     "gentle": [[35.0, 15], [40.0, 15], [48.0, 22], [55.0, 34], [62.0, 52], [68.0, 72], [72.0, 88],
                [75.0, 100], [95.0, 100]],
+    # top80: the steep curve with its top end eased - the segment at 70 C was asking 90% where 80% is plenty, and
+    # full speed arrives at 80 C rather than 75.  Measured context for accepting the higher ceiling: two minutes of
+    # all-core matrixprod held 77-81 C at 4300 MHz with the fan at 100% from t+20s, so ~5 C of headroom above the peak
+    # before anything throttles, and the fan still reaches 100% before the CPU gets there.
+    "top80": [[40.0, 2], [45.0, 10], [50.0, 22], [55.0, 38], [60.0, 55], [65.0, 70], [70.0, 80],
+              [75.0, 90], [80.0, 100], [95.0, 100]],
 }
+
+# the ceiling each preset is allowed to use, checked against check_cpu_ceiling()
+PRESET_CEILING = {"steep": 75.0, "gentle": 75.0, "top80": 80.0}
 CPU_RAD_PRESET = "steep"
 CPU_RAD_CURVE = CPU_CURVES[CPU_RAD_PRESET]
 # The radiator pair does not ramp for the 3090 at all until 70 C.  Its fans idle at 641 RPM whatever the duty, so a
@@ -272,7 +281,7 @@ function_uid = "0"
     return join_segments(segs)
 
 
-def check_cpu_ceiling(curve):
+def check_cpu_ceiling(curve, ceiling=75.0):
     """Refuse a CPU curve that cannot reach 100%, or that is not already there by a temperature a loaded 10900X reaches.
 
     This exists because the curve that shipped at first capped out at 55% and nothing stopped it - the fans that carry
@@ -282,11 +291,18 @@ def check_cpu_ceiling(curve):
     if top < 100.0:
         sys.exit(f"REFUSED: the CPU radiator curve peaks at {top:.0f}%, so the pair can never run at full speed. "
                  f"It must reach 100%.")
-    at75 = curve_at(curve, 75.0)
-    if at75 < 100.0:
-        sys.exit(f"REFUSED: the CPU curve is only {at75:.0f}% at 75 C; it must be at 100% by then (a loaded "
+    if ceiling not in (75.0, 80.0):
+        sys.exit(f"REFUSED: unsupported ceiling {ceiling}; 75 (default) or 80 (explicitly accepted) only")
+    at = curve_at(curve, ceiling)
+    if at < 100.0:
+        sys.exit(f"REFUSED: the CPU curve is only {at:.0f}% at {ceiling:.0f} C; it must be at 100% by then (a loaded "
                  f"i9-10900X on this AIO sits above that, and the radiator fans are what move the heat out).")
-    log(f"CPU ceiling check: 100% by 75 C ({curve_at(curve, 75.0):.0f}% at 75 C, {top:.0f}% maximum)")
+    if ceiling >= 80.0:
+        log(f"CPU ceiling check: 100% by {ceiling:.0f} C - ACCEPTED ABOVE THE 75 C DEFAULT.  Measured under two "
+            f"minutes of all-core matrixprod: 77-81 C at 4300 MHz with the fan already at 100%, so this trades a few "
+            f"degrees of running temperature for a quieter top end.")
+    else:
+        log(f"CPU ceiling check: 100% by {ceiling:.0f} C ({at:.0f}% there, {top:.0f}% maximum)")
 
 
 def build_retune(text, parsed, a_preset="steep"):
@@ -300,7 +316,7 @@ def build_retune(text, parsed, a_preset="steep"):
     elsewhere is worth more here than reusing the helper, so this finds each table by its uid and rewrites one line.
     """
     cpu_curve = CPU_CURVES[a_preset]
-    check_cpu_ceiling(cpu_curve)
+    check_cpu_ceiling(cpu_curve, PRESET_CEILING[a_preset])
     profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
     if RAD_MIX_UID not in profiles:
         sys.exit("not applied yet: the radiator mix is absent.  Run 'apply' instead of 'retune'.")
