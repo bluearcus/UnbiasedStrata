@@ -118,10 +118,14 @@ def build(cfg, target, speed):
 
 
 def unchanged_others(before, after, target):
-    """Everything except the target's entry must be identical - including the other card, which is not ours here."""
+    """Everything except the target's entries must be identical - including the other card, which is not ours here."""
     b = copy.deepcopy(before); a = copy.deepcopy(after)
     b.get("gpus", {}).pop(target, None)
     a.get("gpus", {}).pop(target, None)
+    for prof in (b.get("profiles") or {}).values():
+        (prof.get("gpus") or {}).pop(target, None)
+    for prof in (a.get("profiles") or {}).values():
+        (prof.get("gpus") or {}).pop(target, None)
     if b != a:
         log("REFUSED: something other than the 4070 entry changed.  Diff of the untouched parts:")
         for k in set(list(b.keys()) + list(a.keys())):
@@ -135,6 +139,56 @@ def unchanged_others(before, after, target):
     return True
 
 
+def scopes(cfg, target):
+    """Every place in the config that can hold fan settings for this GPU: the base entry, plus each profile."""
+    out = []
+    base = (cfg.get("gpus") or {}).get(target)
+    if base is not None:
+        out.append(("base", base))
+    for name, prof in (cfg.get("profiles") or {}).items():
+        g = ((prof or {}).get("gpus") or {}).get(target)
+        if g is not None:
+            out.append((f"profile:{name}", g))
+    return out
+
+
+def effective_scope(cfg, target):
+    """Which scope the daemon actually reads: the active profile if it carries this GPU, else the base entry."""
+    active = cfg.get("current_profile")
+    if active:
+        g = (((cfg.get("profiles") or {}).get(active) or {}).get("gpus") or {}).get(target)
+        if g is not None:
+            return f"profile:{active}", g
+    base = (cfg.get("gpus") or {}).get(target)
+    return ("base", base) if base is not None else (None, None)
+
+
+def pick_scopes(cfg, target, choice):
+    """Resolve --scope into the set of scope labels to write."""
+    all_labels = [lbl for lbl, _ in scopes(cfg, target)]
+    if choice == "auto":
+        lbl, _ = effective_scope(cfg, target)
+        if lbl is None:
+            sys.exit(f"{target} has no fan settings anywhere in {CONFIG}")
+        return [lbl]
+    if choice == "all":
+        return all_labels
+    if choice == "base":
+        return ["base"]
+    if choice.startswith("profile:"):
+        if choice not in all_labels:
+            sys.exit(f"no fan settings for {target} in {choice}; available: {', '.join(all_labels)}")
+        return [choice]
+    sys.exit(f"unknown --scope {choice!r}")
+
+
+def get_scope_container(cfg, target, label):
+    if label == "base":
+        return (cfg.get("gpus") or {})[target]
+    name = label.split(":", 1)[1]
+    return (cfg["profiles"][name].setdefault("gpus", {}))[target]
+
+
 def curve_at(pts, t):
     """Evaluate a sparse curve at temperature t, clamped at both ends."""
     pts = sorted(pts.items()) if isinstance(pts, dict) else pts
@@ -146,21 +200,19 @@ def curve_at(pts, t):
     return pts[-1][1]
 
 
-def build_curve(cfg, target, preset):
-    if target not in (cfg.get("gpus") or {}):
-        sys.exit(f"{target} is not in {CONFIG}")
-    other = next((u for u in TARGETS.values() if u != target), None)
+def build_curve(cfg, target, preset, labels):
     out = copy.deepcopy(cfg)
-    g = out["gpus"][target]
-    g["fan_control_enabled"] = True
-    fcs = g.setdefault("fan_control_settings", {})
-    fcs["mode"] = "curve"
-    fcs["temperature_key"] = "edge"
-    fcs.setdefault("interval_ms", 1000)
-    fcs.setdefault("change_threshold", 2)
-    fcs.setdefault("auto_threshold", 0)
-    fcs.setdefault("spindown_delay_ms", 8000)
-    fcs["curve"] = dict(CURVES[preset])
+    for label in labels:
+        g = get_scope_container(out, target, label)
+        g["fan_control_enabled"] = True
+        fcs = g.setdefault("fan_control_settings", {})
+        fcs["mode"] = "curve"
+        fcs["temperature_key"] = "edge"
+        fcs.setdefault("interval_ms", 1000)
+        fcs.setdefault("change_threshold", 2)
+        fcs.setdefault("auto_threshold", 0)
+        fcs.setdefault("spindown_delay_ms", 8000)
+        fcs["curve"] = dict(CURVES[preset])
     return out
 
 
@@ -192,6 +244,11 @@ def backups():
 def cmd_status(a):
     cfg = load()
     target = resolve_target(a.gpu)
+    eff_label, _ = effective_scope(cfg, target)
+    log(f"current_profile={cfg.get('current_profile')!r}  scopes in effect for {a.gpu}: {eff_label}")
+    for lbl, g in scopes(cfg, target):
+        f = g.get("fan_control_settings") or {}
+        log(f"  {'*' if lbl == eff_label else ' '} {lbl:22s} key={f.get('temperature_key')!r:8s} {f.get('curve')}")
     log(f"{CONFIG}:")
     show_gpu(cfg, GPU_3090, "3090 (LACT curve, VRAM-keyed)")
     show_gpu(cfg, GPU_4070, "4070")
@@ -246,9 +303,16 @@ def cmd_pin(a):
 def cmd_curve(a):
     cfg = load()
     target = resolve_target(a.gpu)
-    out = build_curve(cfg, target, a.preset)
-    cur = (cfg["gpus"][target].get("fan_control_settings") or {})
-    log(f"{a.gpu}: curve {cur.get('curve')} key={cur.get('temperature_key')!r}")
+    eff_label, eff = effective_scope(cfg, target)
+    log(f"scopes holding fan settings for {a.gpu}:")
+    for lbl, g in scopes(cfg, target):
+        f = g.get("fan_control_settings") or {}
+        mark = "  <-- IN EFFECT" if lbl == eff_label else ""
+        log(f"  {lbl:22s} key={f.get('temperature_key')!r:8s} curve={f.get('curve')}{mark}")
+    labels = pick_scopes(cfg, target, a.scope)
+    out = build_curve(cfg, target, a.preset, labels)
+    log(f"writing to: {', '.join(labels)}")
+    cur = (eff or {}).get("fan_control_settings") or {}
     log(f"  -> preset {a.preset!r}: {CURVES[a.preset]} key='edge'")
     # show what actually changes at the temperatures this card really occupies
     for t in (27, 43, 49, 53, 57):
@@ -308,6 +372,8 @@ def main():
     ap.add_argument("command", choices=["status", "pin", "curve", "restore"])
     ap.add_argument("--preset", default="moderate", choices=sorted(CURVES),
                     help="with curve: which edge-unit preset to install")
+    ap.add_argument("--scope", default="auto",
+                    help="curve: auto (the scope in effect), all, base, or profile:<name>")
     ap.add_argument("--gpu", default="4070", help="3090, 4070, or a full PCI id (default 4070)")
     ap.add_argument("--speed", type=float, default=0.80, help="static fan speed, 0.20-1.00 (default 0.80)")
     ap.add_argument("--dry-run", action="store_true")
