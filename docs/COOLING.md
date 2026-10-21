@@ -499,6 +499,37 @@ card is sitting at ~48 % fan with VRAM at 74 C, and a curve keyed to VRAM would 
 between those is the quiet setting that buys the degrees — and it should be *measured* by stepping the fan and reading
 VRAM, not inferred from the curve, because the curve has just been shown not to mean what we thought.
 
+### Which memory chip runs hottest
+
+Per-chip VRAM sensors are exposed through NVAPI (`lact cli stats`), 24 of them: 12 chips x Front/Back.  Steady-state
+values from the two matched runs, with only the 4070's fan differing:
+
+| chip | 4070 @ 30 % | 4070 @ 80 % | change |
+| --- | --- | --- | --- |
+| **D1 Back** | **76.0 C** | **72.8 C** | -3.2 |
+| B0 Back | 76.0 C | 71.6 C | -4.4 |
+| C1 Back | 74.4 C | 72.4 C | -2.0 |
+| E0 Back | 76.0 C | 71.2 C | -4.8 |
+| C0 Back | 74.0 C | 70.8 C | -3.2 |
+| hottest *front* chip (C0/E0) | 70.0 C | 68.4 C | -1.6 |
+
+**D1's back sensor is hottest in both runs**, so it is not a single-run artifact; averaged over the pair the worst three
+are D1 Back (74.4 C), B0 Back (73.8), E0 Back (73.6).  No front-side chip reaches the top ten.
+
+Aggregated by side, which is the number that matters for the backplate argument:
+
+```
+all Back  chips mean:  73.5 -> 69.8 C   (-3.7)
+all Front chips mean:  67.9 -> 65.9 C   (-2.0)
+```
+
+The 4070 improved the back side **1.9x as much as the front**, which is the direct confirmation that its fans are
+working on the back of the board and not merely stirring the case.  The problem being solved is entirely a back-side
+problem; front-side temperatures are almost bystanders.
+
+Caveat: the letters are NVAPI identifiers.  NVIDIA does not document which physical package each maps to, so "D1" is
+reproducible but not locatable - it cannot be tied to a position on the PCB without a board diagram.
+
 ### The mixes (`tools/coolercontrol/mix_profiles.py`) — applied 2026-10-20
 
 A VRAM-only curve is wrong for a **shared** case fan: at CPU-only work the GPU is cool, so a VRAM-only curve lets an
