@@ -30,7 +30,7 @@ the prose further down is background.
 | O11 | **The 3090's fan curve is keyed on edge temp, and the curve's useful band is outside where the card operates.**  Edge saturates at 56-57 C while VRAM climbs 72->74 at full load, and the current curve only reaches 100% at edge 80 C, so it self-caps near 50%.  Fix is a curve compressed into the edge band the card actually uses, or a hotspot key (hotspot tracks VRAM within 4 C, edge within 12-18 C).  **Confirm LACT owns that fan** first: set the curve flat to 0.45 in the GUI and see whether idle fan moves 30% -> 45% | you, GUI | needs one observation |
 | O12 | **Summer plan**: a steeper curve on the 3090 instead of the 4070 at 80%.  Two candidate curves are written up below (moderate 48-76% across the working band, aggressive 55-91%); which is right depends on the **fan-to-VRAM response**, still unmeasured — the sweep steps the fan 50/60/70% under load and reads VRAM | you decide | O11 |
 | O12 | **Summer plan**: rather than the 4070 at 80% (which was unacceptably loud), a steeper curve on the 3090 itself — noted from your listening test, to be settled *after* O11, since the useful curve depends on which sensor is actually driving that fan | you decide | O11 |
-| O10 | **Decide how the 4070's boost should be triggered.** Constant 80% is too loud for a card that is otherwise silent, and LACT can only key a card's curve on *its own* sensors, so this needs cross-card logic (a small daemon that reads the 3090's VRAM temp and pins/drops the 4070). Not started by design: it needs your call on the noise policy. Also unmeasured: **where the knee is** — 80% was picked arbitrarily, and a 40/55/70% sweep would find the cheapest speed that still helps | you decide | O9 measured |
+| O10 | **The 4070 boost should trigger on D1 Back, not the aggregate VRAM sensor** — full design below.  Not built: writing fan speed needs root, and the speed knee is unmeasured | you decide | design written |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
 | O4 | Create one **CPU-sourced Graph profile** — **done**: `CPU temp profile`, source `Package id 0` on `coretemp` (verified it is not the NVMe `Composite` sensor, which also exposes `temp1`) | you, GUI | closed |
 | O5 | Mix Profiles on `fan3`/`fan4`/`fan6` — **done**: `Case Fans (CPU or VRAM)`, `Max`, members `CPU temp profile` + `Top Rear Exhaust (VRAM)` | assistant | closed |
@@ -529,6 +529,46 @@ problem; front-side temperatures are almost bystanders.
 
 Caveat: the letters are NVAPI identifiers.  NVIDIA does not document which physical package each maps to, so "D1" is
 reproducible but not locatable - it cannot be tied to a position on the PCB without a board diagram.
+
+### O10, revised: trigger on D1 Back, because the aggregate sensor gives up
+
+The original O10 sketch watched the aggregate VRAM temperature.  The per-chip data kills that idea: the aggregate sensor
+flattens at 74 C while individual back-side chips are still climbing, so a trigger built on it goes quiet exactly when
+it is needed.  D1 Back is hottest in both matched runs (see "Which memory chip runs hottest") and keeps moving last.
+
+**Trigger design:**
+
+| element | choice | why |
+| --- | --- | --- |
+| primary sensor | **D1 Back** | hottest in both runs; the last sensor still rising at plateau |
+| fallback if D1 is missing/glitched | mean of the four hottest back chips (D1, B0, C1, E0) | one bad sensor should not disable cooling |
+| on threshold | D1 Back >= 70 C | below the 72.8 C plateau, so it engages before the plateau is reached |
+| off threshold | D1 Back <= 64 C | 6 K deadband, comfortably more than sensor noise |
+| minimum on-time | 90 s | stops hunting when the load oscillates between requests |
+| suppression | skip while the 4070 draws > 40 W | when it is busy its own fans already spin; overriding driver fan management there is how you get instability |
+| speed | 55-65 % ***unmeasured*** | 80 % was audibly unacceptable; the knee has never been found (see O12's sweep) |
+| fail-safe | restore the 4070's previous settings on exit, including signal/power loss | a daemon that dies while boosting must not leave the card loud forever |
+
+**Why it is not built yet.**  Two real blockers, neither of them coding effort:
+
+1. **Writing fan speed needs root.**  LACT's socket is `root:sudo`, and the CLI has no fan subcommand, so the only path
+   is editing `/etc/lact/config.yaml` and restarting `lactd` - see `tools/lact/fan_pin.py`, which does exactly that with
+   backup, verification and rollback.  A daemon doing this on a timer would be a root service restarting `lactd` around
+   inference.  That wants a decision, not a default.
+2. **The speed knee is unmeasured.**  Choosing 80 % by hand was a mistake we have already paid for once.
+
+**Verification, and why it matters here.**  `temperature_key` cannot be trusted on this machine: the 3090's config has
+said `vram` all along while the fan demonstrably follows `edge`.  So whenever a curve is changed, confirm what it is
+actually keyed on rather than what the YAML says:
+
+```
+python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/which_sensor.py --gpu 3090 --seconds 120
+```
+
+It samples the fan against edge, hotspot, aggregate VRAM and all 24 per-chip sensors, evaluates the configured curve at
+each, and reports which candidate's prediction matches the fan.  It needs real load - it says so instead of pretending
+when nothing moves.  First result, on the unmodified config: **fan tracks `edge`; config claims `vram`** (best-fit error
+edge ~6 %, against hotspot ~20 % and aggregate VRAM ~19 %).
 
 ### The mixes (`tools/coolercontrol/mix_profiles.py`) — applied 2026-10-20
 
