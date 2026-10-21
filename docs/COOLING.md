@@ -26,7 +26,8 @@ the prose further down is background.
 | O3 | Steepen the intake curve / the card's own fan curve to buy a few more degrees | you decide | see "Soak result" below |
 | O7 | Calibrate `fan1` — **done**: starts spinning at **0% duty**, max **1771 RPM**, so it cannot be parked | you, GUI | closed |
 | O8 | `fan1` under automatic control — **done**, but on its own profiles, not the shared mix (see "Radiator pair and exhaust balance"). Mean exhaust speed fell 15-21% for a mean VRAM change of **-0.5 C** | assistant | closed |
-| O9 | **4070 as a backplate blower**: the 4070 sits half a slot above the 3090 and intakes from that gap, so ramping it drains the hot blanket sitting on the 3090's backplate — its hottest, least-cooled surface. Test with a decay A/B (4070 fan pinned high vs its VBIOS 30%) before committing to the noise | assistant | O8 measured |
+| O9 | **4070 as a backplate blower** — **done, it works**: pinned to 80% static (2715 RPM) the 3090's VRAM settles **2.4 C lower** (76.2 → 73.8 C) and peaks 4 C lower, with every case fan and the 3090's own fan *slower*. Detail and caveats below | assistant | closed, see "O9" |
+| O10 | **Decide how the 4070's boost should be triggered.** Constant 80% is too loud for a card that is otherwise silent, and LACT can only key a card's curve on *its own* sensors, so this needs cross-card logic (a small daemon that reads the 3090's VRAM temp and pins/drops the 4070). Not started by design: it needs your call on the noise policy | you decide | O9 measured |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
 | O4 | Create one **CPU-sourced Graph profile** — **done**: `CPU temp profile`, source `Package id 0` on `coretemp` (verified it is not the NVMe `Composite` sensor, which also exposes `temp1`) | you, GUI | closed |
 | O5 | Mix Profiles on `fan3`/`fan4`/`fan6` — **done**: `Case Fans (CPU or VRAM)`, `Max`, members `CPU temp profile` + `Top Rear Exhaust (VRAM)` | assistant | closed |
@@ -370,6 +371,59 @@ GPU intake stayed where it was, which is the one that actually feeds the 3090.
 Caveat kept on the record: the intake/exhaust balance ratio (0.88 this run) **cannot** be compared against the
 earlier run, because the harness at that time did not sample `pwm1` at all — its "intake" was `fan5` alone.  The
 ratio is only comparable from now on.
+
+### O9: the 4070 as a backplate blower — it works, and here is what it costs
+
+The 4070 sits half a slot above the 3090 and both cards intake from underneath, so at rest the 4070's fans sit at
+their VBIOS 30% (1300 RPM) while 67 W of idle card leaves a warm blanket on the 3090's backplate — the 3090's
+hottest, least-cooled surface.  Pinned to 80% static (2715 RPM) through LACT (`tools/lact/pin4070.py`), that card
+becomes a free blower aimed at exactly the right place.
+
+**The mechanism is real, measured directly.**  While the 3090 decoded, the worst back-side memory chip ran **74 C
+against 70 C for the worst front-side chip** — the backplate is genuinely the hot side, which is the premise the
+whole idea rests on.
+
+Steady-state VRAM on the 3090, matched 6-minute runs, identical payload, no other config change:
+
+| minute | 4070 at VBIOS 30% | 4070 pinned 80% | delta |
+| --- | --- | --- | --- |
+| 0 | 67.2 C | 53.3 C | −13.8 |
+| 1 | 73.0 C | 65.5 C | −7.5 |
+| 2 | 75.5 C | 70.0 C | −5.5 |
+| 3 | 76.0 C | 72.0 C | −4.0 |
+| 4 | 76.0 C | 73.2 C | −2.8 |
+| 5 | 76.2 C | 73.8 C | **−2.4** (settled) |
+
+Whole-run peak 78 → **74 C**.  And crucially it was not bought by working the 3090 harder — everything on the 3090's
+own cooling ran *slower* because it was cooler:
+
+| | VBIOS 30% | pinned 80% |
+| --- | --- | --- |
+| 3090's own fan (plateau) | 50 % | 48 % |
+| radiator pair `fan1` | 47.4 % | 47.7 % |
+| rear exhaust `fan3` | 59.4 % | 58.7 % |
+| top forward `fan4` | 60.2 % | 59.2 % |
+| GPU intake `fan5` | 71.1 % | **65.0 %** |
+| top rear `fan6` | 65.3 % | 64.5 % |
+
+So the 3090 is cooler **and quieter**; the price is paid entirely on the 4070, at 2715 RPM — a card that is
+otherwise inaudible.  That is the whole trade, and it is a policy question rather than a technical one.
+
+**Caveats kept on the record, because this was not a perfect A/B:**
+
+* The runs were **sequential, not interleaved**, and started from different temperatures (62 C vs 40 C).  The
+  table is a per-minute comparison precisely so the ramp does not flatter the result; the steady-state figure is the
+  one to trust, and it is the −2.4 C at minutes 5-6.
+* One pair of runs, in one ambient.  Evening-to-midnight ambient drift is unquantified.
+* A confirmatory interleaved pair (pin / unpin / pin) is worth an hour if this ever becomes load-bearing rather than
+  interesting.
+
+**Why this is not switched on as a permanent setting.**  LACT's `temperature_key` can only select sensors on the card
+it is configuring, so the 4070 cannot be told "speed up when the *3090* is hot" from its own config.  Constant 80%
+is the only thing its config can express, and constant 2715 RPM for a card that is idle most of the day is a bad
+default.  The useful version is conditional — boost the 4070 only while the 3090's VRAM is above ~65 C and the 4070
+is idle — which needs a small daemon reading `/run/vramsensor/vram.temp1` and driving the 4070 through LACT.
+Recorded as **O10**; not built, because it is a noise-policy decision before it is a coding one.
 
 ### The mixes (`tools/coolercontrol/mix_profiles.py`) — applied 2026-10-20
 
