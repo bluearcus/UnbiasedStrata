@@ -354,7 +354,11 @@ def cmd_restore(a):
     if not bks:
         sys.exit(f"no backups found matching {os.path.dirname(CONFIG)}/{BACKUP_GLOB}")
     if a.from_path:
+        # accept a bare backup name ("curvebak-2026...") as well as a full path, so the command stays short enough to
+        # paste without the shell wrapping it mid-option
         src = a.from_path
+        if "/" not in src:
+            src = os.path.join(os.path.dirname(CONFIG), src)
     elif a.last:
         src = bks[-1]
     elif a.scope != "full":
@@ -362,7 +366,8 @@ def cmd_restore(a):
     else:
         src = bks[0]
     if not os.path.exists(src):
-        sys.exit(f"no such backup: {src}")
+        avail = "\n  ".join(os.path.basename(b) for b in bks) or "(none)"
+        sys.exit(f"no such backup: {src}\navailable:\n  {avail}")
     snap = yaml.safe_load(open(src, encoding="utf-8"))
 
     if a.scope == "full":
