@@ -28,7 +28,7 @@ the prose further down is background.
 | O8 | `fan1` under automatic control — **done**, but on its own profiles, not the shared mix (see "Radiator pair and exhaust balance"). Mean exhaust speed fell 15-21% for a mean VRAM change of **-0.5 C** | assistant | closed |
 | O9 | **4070 as a backplate blower** — **done, it works**: pinned to 80% static (2715 RPM) the 3090's VRAM settles **2.4 C lower** (76.2 → 73.8 C) and peaks 4 C lower, with every case fan and the 3090's own fan *slower*. Detail and caveats below | assistant | closed, see "O9" |
 | O11 | **Closed - it is a hardware limit, not a config bug.**  On 30-series the BIOS fan-curve API accepts **only GPU (edge) temperature**; VRAM and per-chip sensors are readable but not selectable as a curve source.  LACT cannot key on VRAM on this card at all, so `temperature_key: vram` is dead configuration and every curve must be written in edge units | answered | closed |
-| O12 | **Summer plan**: the shifted edge curve is applied and measured (see "The edge curve, measured"). +17 points of fan bought **-2 C** on VRAM, about 0.12 C per point - reaching 68 C would need ~97% fan. So the 3090 is airflow-limited, not fan-limited: the `summer` preset (88% at the plateau) is expected to buy ~1 C for a lot of noise. Summer work should prefer added airflow (O10) over more fan spin | you decide | measured |
+| O13 | **Summer pickup, not built: a proper VRAM-based response.**  Extend the exporter to publish the worst chip per card, then drive fans from what the memory is actually doing - the 3090 from its own worst chip, the 4070 from max(3090, 4070).  One mechanism constraint to design around: **CoolerControl cannot set GPU fan duty** (it drives the NCT6797 motherboards headers only; the card's channel reads Unmanaged), so GPU duty has to go through LACT - ideally its socket API, which the GUI uses to change settings without restarting the daemon | nobody yet | O12 measured |
 | O12 | **Summer plan**: rather than the 4070 at 80% (which was unacceptably loud), a steeper curve on the 3090 itself — noted from your listening test, to be settled *after* O11, since the useful curve depends on which sensor is actually driving that fan | you decide | O11 |
 | O10 | **The 4070 boost should trigger on D1 Back, not the aggregate VRAM sensor** — full design below.  Not built: writing fan speed needs root, and the speed knee is unmeasured | you decide | design written |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
@@ -558,6 +558,34 @@ Two things this run also showed, both worth keeping:
 
 For summer, this makes the ranking explicit: added airflow first (O10's D1-driven 4070 boost), a marginal extra curve
 step second, and expecting 68 C from motherboard fans not at all.
+
+### O13: the summer pickup, and why the edge curve cannot be tuned out of this
+
+Settled as the place we stop for now, with the design written down rather than half-remembered.
+
+**Why the current setup is self-limiting, precisely.**  The card's shroud fans pressurise the cooler and cool the *core* far
+more effectively than the memory on the reverse of the board.  So when VRAM heat drives the fan up through an edge-keyed
+curve, edge falls faster than VRAM does, the curve backs off, and the mechanism neutralises itself.  That is not a bad
+curve - it is a curve measuring a sensor that its own action moves.  A VRAM-driven response cannot be approximated from
+edge at all; it needs the memory sensors as the input.
+
+**The summer pickup (O13), if it is needed:**
+
+1. Extend `tools/vram_sensor.py` to publish the **worst chip per card** - the 3090's hottest of the 24, and the 4070's own
+   reading - instead of only the aggregate.
+2. Drive fans from those: **the 3090 from its own worst chip, the 4070 from max(3090 worst, 4070 worst)** - the 4070 existing
+   to cool the 3090's backplate, so it should follow the 3090's need as well as its own.
+3. Keep the existing CoolerControl work untouched: it owns the motherboard headers and the CPU/AIO side, and it does that well.
+
+**One constraint the plan must respect.**  CoolerControl **cannot** set GPU fan duty - it drives the NCT6797 headers, and the
+3090's fan channel appears there as Unmanaged (O1).  So the GPU side has to go through LACT.  Editing `/etc/lact/config.yaml`
+and restarting `lactd` per change (what `fan_pin.py` does) is fine for a one-off but wrong for a control loop; the right
+actuator is LACT's socket API, which the GUI already uses to change fan settings live with no restart.  Half an hour of
+protocol discovery is the first step of O13, not an afterthought.
+
+An open question worth testing then, cheaply: whether **40-series** BIOS fan control accepts a VRAM temperature source.  The
+30-series limitation was established on this card; if the 4070 can be keyed on VRAM directly in LACT, part of O13 collapses
+into configuration.  The config carries `temperature_key: vram` for the 4070 today, untested.
 
 ### Which memory chip runs hottest
 
