@@ -583,9 +583,17 @@ and restarting `lactd` per change (what `fan_pin.py` does) is fine for a one-off
 actuator is LACT's socket API, which the GUI already uses to change fan settings live with no restart.  Half an hour of
 protocol discovery is the first step of O13, not an afterthought.
 
-An open question worth testing then, cheaply: whether **40-series** BIOS fan control accepts a VRAM temperature source.  The
-30-series limitation was established on this card; if the 4070 can be keyed on VRAM directly in LACT, part of O13 collapses
-into configuration.  The config carries `temperature_key: vram` for the 4070 today, untested.
+**Both cards need the agent.  Neither half collapses into configuration:**
+
+* the **3090** cannot be keyed on its own worst chip, because 30-series accepts only edge (established above), and
+* the **4070** cannot be keyed on `max(3090 worst, 4070 worst)` **even if 40-series accepts a VRAM source**, because a
+  per-card curve sees only that card's own sensors.  `max()` across two cards is not expressible by LACT's curve and not by
+  the BIOS fan table either - it is not a matter of finding the right key name.
+
+So the external agent is mandatory on both sides, and O13 is one piece of work, not one piece plus a config change.
+Worth still testing, cheaply and separately, whether 40-series accepts VRAM at all - it decides whether the 4070's own
+contribution can be a *local* curve with the cross-card boost layered on top, or whether both temperatures have to be
+computed in the agent.
 
 ### Which memory chip runs hottest
 
