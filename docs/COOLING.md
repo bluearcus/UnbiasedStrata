@@ -27,7 +27,7 @@ the prose further down is background.
 | O7 | Calibrate `fan1` — **done**: starts spinning at **0% duty**, max **1771 RPM**, so it cannot be parked | you, GUI | closed |
 | O8 | `fan1` under automatic control — **done**, but on its own profiles, not the shared mix (see "Radiator pair and exhaust balance"). Mean exhaust speed fell 15-21% for a mean VRAM change of **-0.5 C** | assistant | closed |
 | O9 | **4070 as a backplate blower** — **done, it works**: pinned to 80% static (2715 RPM) the 3090's VRAM settles **2.4 C lower** (76.2 → 73.8 C) and peaks 4 C lower, with every case fan and the 3090's own fan *slower*. Detail and caveats below | assistant | closed, see "O9" |
-| O11 | **The 3090's fan curve is keyed on edge temp, and the curve's useful band is outside where the card operates.**  Edge saturates at 56-57 C while VRAM climbs 72->74 at full load, and the current curve only reaches 100% at edge 80 C, so it self-caps near 50%.  Fix is a curve compressed into the edge band the card actually uses, or a hotspot key (hotspot tracks VRAM within 4 C, edge within 12-18 C).  **Confirm LACT owns that fan** first: set the curve flat to 0.45 in the GUI and see whether idle fan moves 30% -> 45% | you, GUI | needs one observation |
+| O11 | **Closed - it is a hardware limit, not a config bug.**  On 30-series the BIOS fan-curve API accepts **only GPU (edge) temperature**; VRAM and per-chip sensors are readable but not selectable as a curve source.  LACT cannot key on VRAM on this card at all, so `temperature_key: vram` is dead configuration and every curve must be written in edge units | answered | closed |
 | O12 | **Summer plan**: a steeper curve on the 3090 instead of the 4070 at 80%.  Two candidate curves are written up below (moderate 48-76% across the working band, aggressive 55-91%); which is right depends on the **fan-to-VRAM response**, still unmeasured — the sweep steps the fan 50/60/70% under load and reads VRAM | you decide | O11 |
 | O12 | **Summer plan**: rather than the 4070 at 80% (which was unacceptably loud), a steeper curve on the 3090 itself — noted from your listening test, to be settled *after* O11, since the useful curve depends on which sensor is actually driving that fan | you decide | O11 |
 | O10 | **The 4070 boost should trigger on D1 Back, not the aggregate VRAM sensor** — full design below.  Not built: writing fan speed needs root, and the speed knee is unmeasured | you decide | design written |
@@ -499,6 +499,34 @@ card is sitting at ~48 % fan with VRAM at 74 C, and a curve keyed to VRAM would 
 between those is the quiet setting that buys the degrees — and it should be *measured* by stepping the fan and reading
 VRAM, not inferred from the curve, because the curve has just been shown not to mean what we thought.
 
+### Why edge is the only option: the 30-series BIOS fan API
+
+LACT drives these fans through the card's own BIOS fan-control interface, and on 30-series that interface accepts **only
+the GPU (edge) temperature** as a curve source.  VRAM and per-chip VRAM sensors are readable - the 24-chip table above
+comes straight out of NVAPI - but they cannot be *selected* to drive a curve.  This is a property of the firmware
+interface, not of LACT, and no configuration can change it.
+
+That explains every observation without a bug:
+
+* `temperature_key: vram` parses, is accepted, and is ignored.  The key is unrepresentable, so the daemon falls back to
+  edge.  This is why `which_sensor.py` scores edge at ~6 % error against hotspot and aggregate VRAM at ~19-20 %.
+* The curve's useful band (up to 80 C) is outside where this workload operates (edge 49-57 C), so it self-caps near
+  50 %: the 47-48 % we measured, for as long as we have been measuring it.
+
+**Three consequences, all of which change the plan:**
+
+1. **Every curve on the 3090 must be written in edge units, permanently.**  The moderate/aggressive curves above are the
+   only route.  `temperature_key` should be set to `edge` for honesty - it changes no behaviour, it just stops the file
+   from claiming something the hardware cannot do.
+2. **An edge-keyed curve is a proxy, and a loose one.**  The edge-to-VRAM offset measured between +9 and +18 C, and it
+   drifts upward at plateau (edge sits flat at 56-57 while VRAM goes 72 -> 74).  An edge curve therefore carries roughly
+   **9 C of uncertainty about the memory temperature it is actually guarding**, and the offset is workload-dependent: a
+   workload with different memory-traffic characteristics will shift it.  Tuning a curve for this engine's offset is
+   fitting to one workload, not solving the problem.
+3. **Anything genuinely VRAM- or D1-driven must be an external agent** - read the sensor through LACT/NVAPI, then set fan
+   speed through the same BIOS interface.  That is exactly O10's daemon, so it is no longer an optional refinement: it
+   is the only way to drive these fans from memory temperature at all.
+
 ### Which memory chip runs hottest
 
 Per-chip VRAM sensors are exposed through NVAPI (`lact cli stats`), 24 of them: 12 chips x Front/Back.  Steady-state
@@ -551,10 +579,13 @@ it is needed.  D1 Back is hottest in both matched runs (see "Which memory chip r
 
 **Why it is not built yet.**  Two real blockers, neither of them coding effort:
 
-1. **Writing fan speed needs root.**  LACT's socket is `root:sudo`, and the CLI has no fan subcommand, so the only path
-   is editing `/etc/lact/config.yaml` and restarting `lactd` - see `tools/lact/fan_pin.py`, which does exactly that with
-   backup, verification and rollback.  A daemon doing this on a timer would be a root service restarting `lactd` around
-   inference.  That wants a decision, not a default.
+1. **How the daemon should write fan speed is unsettled.**  Two paths exist.  (a) Edit `/etc/lact/config.yaml` and
+   restart `lactd` - what `tools/lact/fan_pin.py` does, with backup, verification and rollback.  It works, but a daemon
+   bouncing the GPU daemon around inference is a poor shape for something that may run hourly.  (b) Drive LACT's own
+   socket API, which is how the GUI changes fan settings live with no restart.  The socket is `root:sudo` and speaks a
+   JSON command protocol on a Unix socket; the protocol is undocumented here and would need discovery, but if (b) works
+   it removes the restart problem entirely and makes the agent a plain user-service.  Worth half an hour before
+   committing to (a).
 2. **The speed knee is unmeasured.**  Choosing 80 % by hand was a mistake we have already paid for once.
 
 **Verification, and why it matters here.**  `temperature_key` cannot be trusted on this machine: the 3090's config has
