@@ -201,3 +201,85 @@ Worth stating so it does not get undone by a rebase:
   under a hot-reload design (D) it becomes a problem — a name that changes under a live client is its own kind of lie,
   and D would need a stable id with the quant reported separately.  **Decide this before starting D.**
 * `--expert-profile` is already per-pack, so per-model tier learning persists across restarts today.
+
+---
+
+## 7. Work estimate
+
+### 7.1 What is already built (this is why the numbers below are small)
+
+| piece | state | where |
+| --- | --- | --- |
+| K/V session files | **complete**: atomic write via temp file + rename + folder flush, free-space preflight, oversized/foreign files refused before allocation, streaming K/V read straight from the device without a host copy | `include/strata/core/conversation_file.hpp`, `session_save_reclaim.hpp` |
+| Session *identity* binding | **complete**: `SessionFileIdentity { model, config }`, and *"a read with any other identity is refused before the payload is parsed"* | `conversation_file.hpp:25` |
+| Engine `SAVE <path>` / `RESTORE <path>` | **complete**, with progress lines (`SESSION`, `SAVED`, `SERR`) | `generate.cpp:11480-11647` |
+| Checkpoint selection for a save | **complete**, incl. freeing reconstructible host caches first (`--session-save-reclaim`) | `generate.cpp:11560-11605` |
+| Front-end process control of the engine | **complete**: `fork`+`exec`, `stop()`, `quit()`, `can_stop()`, READY-until-timeout wait | `frontend/engine.hpp:70-160` |
+| Front-end HTTP surface | **complete** for completions/tokenize; **no route** reaches SAVE/RESTORE | `strata_context.cpp:1419+` |
+
+Two consequences worth stating plainly:
+
+* **Cross-quant K/V transplant is already impossible by construction** - the identity hash covers the model files, so a
+  file written under IQ3_XXS is refused under IQ3_S before it is even parsed.  My earlier worry about a conversation
+  continuing on a memory the new model never produced is handled; nothing needs doing.
+* **The engine does not have to be hot-reloaded to switch models.**  The front end already owns the engine process and
+  already knows how to wait for `READY`.  Switching can be *front-end orchestration of an engine restart* - no engine
+  change at all - which changes the estimate by an order of magnitude.
+
+### 7.2 The two paths, sized
+
+**Path A - front end orchestrates a restart (recommended).**
+
+| step | work | effort |
+| --- | --- | --- |
+| A1 | child start via `posix_spawn` instead of `fork`: `fork()` in a live multi-threaded HTTP process is unsafe, `start()` even says *"must be called before any thread exists"* | **1-2 d**, low risk, ~60 lines |
+| A2 | quiesce: a switching flag that answers `503` to new work, drain the task queue, then `stop()` + reap the child | 1 d, low risk |
+| A3 | a model manifest and `/v1/models` from it: `/models/manifest.json`, entries of {id, gguf, pack, mtp, alias}; `/model/switch {model: id}`; `/health` reporting the live one | 1-2 d, low risk |
+| A4 | SAVE before switch, RESTORE on the way back, keyed by conversation + model identity - reuses the engine commands that already exist | 2-3 d, medium risk (identity plumbing, file naming, preflight failures) |
+| A5 | vocab/template reload after respawn (fast: `vocab_only`, ~1 s; identical between quants so mostly a no-op that must still work for a different model) | 1 d, low risk |
+| A6 | tests: `e2e.sh` switch round trip against the fake engine, engine-side `SAVE`/`RESTORE` already has unit tests | 1-2 d |
+| | **total** | **1.5-2 weeks** |
+
+**Path B - hot reload inside the engine.**
+
+The obstacle is not conceptual, it is that the load path is not a function:
+
+```
+main() at generate.cpp:2185   ->   READY at 10605
+  8,420 lines of setup, 135 `auto` locals, 45 explicit allocation sites, all in one scope
+```
+
+Those locals own the weights, sessions, graphs, arenas, the tier and the plan.  A reload means turning 8.4k lines of
+straight-line `main` body into something that can be constructed, destroyed and constructed again - and every one of those
+135 locals has a lifetime that has to become explicit.
+
+| step | effort | risk |
+| --- | --- | --- |
+| B1 | extract the init into a `ModelRuntime` struct/function (mechanical, invasive) | 2-3 wks | **high** - VRAM planning and graph capture are order-sensitive, and every rebase collides with it |
+| B2 | teardown: release weights, sessions, graphs, both expert arenas, the CPU pool | 1 wk | high |
+| B3 | reload protocol + quiesce + re-`READY` on the same pipes | 1 wk | medium |
+| B4 | re-fill the tier from the other pack's profile; re-plan slots | 3-5 d | medium |
+| | **total** | **5-8 wks** | compounding with every upstream rebase |
+
+Path B buys: no process restart, so the HTTP listener and the client connection survive, and the switch takes seconds
+instead of ~15 s.  It does **not** buy a warm conversation - the K/V is still invalidated by the weights, so the 88 s
+re-prefill is avoided only by A4's save/restore, which Path A has anyway.
+
+### 7.3 What a switch costs after each path
+
+| | today | Path A | Path B |
+| --- | --- | --- | --- |
+| engine restart | yes (compose) | yes (~15 s) | no |
+| HTTP listener / client connection | lost | **kept** (only in-flight work fails) | kept |
+| conversation warm afterwards | no | **yes, if saved** | only with the same save/restore |
+| code touched | - | front end only | front end + 8.4k-line engine init |
+
+### 7.4 Recommendation
+
+Build **A1-A3 and A6 first** (~1 week): a manifest, `/model/switch`, a safe respawn and the tests.  That alone turns
+"switch" from a hand-typed compose command into one HTTP call, keeps the client connected, and makes `pi`'s picker
+honest.  Then decide on **A4** (save/restore) with the measured cost in hand: it is the part that removes the 88 s, and
+it is also the part with the only real correctness question (conversation identity across a save).
+
+**Do not start Path B** unless something needs switching without a restart.  At 5-8 weeks against a shared init path that
+every upstream rebase touches, it is the most expensive way to save 15 seconds.
