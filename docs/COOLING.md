@@ -28,7 +28,7 @@ the prose further down is background.
 | O8 | `fan1` under automatic control — **done**, but on its own profiles, not the shared mix (see "Radiator pair and exhaust balance"). Mean exhaust speed fell 15-21% for a mean VRAM change of **-0.5 C** | assistant | closed |
 | O9 | **4070 as a backplate blower** — **done, it works**: pinned to 80% static (2715 RPM) the 3090's VRAM settles **2.4 C lower** (76.2 → 73.8 C) and peaks 4 C lower, with every case fan and the 3090's own fan *slower*. Detail and caveats below | assistant | closed, see "O9" |
 | O11 | **Closed - it is a hardware limit, not a config bug.**  On 30-series the BIOS fan-curve API accepts **only GPU (edge) temperature**; VRAM and per-chip sensors are readable but not selectable as a curve source.  LACT cannot key on VRAM on this card at all, so `temperature_key: vram` is dead configuration and every curve must be written in edge units | answered | closed |
-| O12 | **Summer plan**: a steeper curve on the 3090 instead of the 4070 at 80%.  Two candidate curves are written up below (moderate 48-76% across the working band, aggressive 55-91%); which is right depends on the **fan-to-VRAM response**, still unmeasured — the sweep steps the fan 50/60/70% under load and reads VRAM | you decide | O11 |
+| O12 | **Summer plan**: the shifted edge curve is applied and measured (see "The edge curve, measured"). +17 points of fan bought **-2 C** on VRAM, about 0.12 C per point - reaching 68 C would need ~97% fan. So the 3090 is airflow-limited, not fan-limited: the `summer` preset (88% at the plateau) is expected to buy ~1 C for a lot of noise. Summer work should prefer added airflow (O10) over more fan spin | you decide | measured |
 | O12 | **Summer plan**: rather than the 4070 at 80% (which was unacceptably loud), a steeper curve on the 3090 itself — noted from your listening test, to be settled *after* O11, since the useful curve depends on which sensor is actually driving that fan | you decide | O11 |
 | O10 | **The 4070 boost should trigger on D1 Back, not the aggregate VRAM sensor** — full design below.  Not built: writing fan speed needs root, and the speed knee is unmeasured | you decide | design written |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
@@ -526,6 +526,38 @@ That explains every observation without a bug:
 3. **Anything genuinely VRAM- or D1-driven must be an external agent** - read the sensor through LACT/NVAPI, then set fan
    speed through the same BIOS interface.  That is exactly O10's daemon, so it is no longer an optional refinement: it
    is the only way to drive these fans from memory temperature at all.
+
+### The edge curve, measured: +17 points of fan bought 2 C
+
+The moderate curve was applied to the active profile and soaked for 5 minutes (30k prompt tokens, ~30k generated,
+93.0 tok/s - throughput unchanged, so nothing here costs tokens).
+
+| edge | hotspot | VRAM | fan | curve asks |
+| --- | --- | --- | --- | --- |
+| 49 | 61 | 58 | 44 % | 48 % |
+| 52 | 64 | 64 | 58 % | 58 % |
+| 53 | 65 | 70 | 58 % | 62 % |
+| 53 | 66 | **72** | **64 %** | 62 % |
+
+**The fan responds now** - 63 % actual against 65 % predicted at edge >= 54 C, so the curve is genuinely in effect and
+edge-keyed, unlike the base-entry edit that did nothing.
+
+**Plateau: VRAM 74 -> 72 C. Cost: fan mean 42 -> 54 %, peak 64 % (about 2500 RPM territory), against 47-48 % before.**
+
+That is roughly **0.12 C per point of fan**. Reaching 68 C would need about 97 % fan. The conclusion is not a tuning
+problem: **the 3090 is airflow-limited, not fan-limited.** There is no curve that fixes it, which is why the 4070 blowing
+across the backplate bought 2.4 C for free while 17 extra points of the card's own fans bought 2 C at real noise.
+
+Two things this run also showed, both worth keeping:
+
+* **The curve settles lower than predicted (64 % not 78 %).**  Edge plateaued at 53-54 C instead of the 56-57 C seen
+  earlier, because the stronger fan cools the core - so the sensor the curve keys on moves *in response to the curve
+  itself*.  Negative feedback through the actuator.  It is a third reason edge cannot stand in for VRAM: the proxy is
+  coupled to the thing it is controlling.
+* **The edge-to-VRAM offset widened to ~19 C** (72 vs 53) from ~18 C (74 vs 56), so it did not behave as a constant.
+
+For summer, this makes the ranking explicit: added airflow first (O10's D1-driven 4070 boost), a marginal extra curve
+step second, and expecting 68 C from motherboard fans not at all.
 
 ### Which memory chip runs hottest
 
