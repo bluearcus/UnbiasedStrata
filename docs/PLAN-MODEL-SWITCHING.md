@@ -85,7 +85,58 @@ Two building blocks already exist and point at how this could be done without re
 What does *not* exist: any command to release the weights, re-plan slots, or re-`READY` a second model.  S2 is the item
 that decides whether model switching is a feature or a restart.
 
-### S6 detail: the one trap worth naming early
+**And the machinery is already in the tree, unbuilt.**  Upstream's multi-model server — `tools/server/server-models.cpp`,
+with `models_max`, load/unload lists and requests that *wait for a model to load* ("a registered conv whose model is still
+loading earns a retry") — is in the submodule and is **not compiled into this fork at all**:
+
+```cmake
+add_library(strata_llama_server STATIC
+  server-http.cpp server-queue.cpp server-task.cpp
+  server-common.cpp server-chat.cpp server-schema.cpp server-stream.cpp
+  frontend/ui_stub/ui.cpp)          # no server-models.cpp, no server-context.cpp
+```
+
+So S2 is not "invent multi-model support".  It is "the fork replaced the file that has it, and would have to either use it
+or reimplement the part of it that matters for a strata engine".  Which parts are reusable against an engine that owns its
+own weights is the actual question, and it is answerable by reading `server-models.cpp` rather than by writing code.
+
+### S6 detail: the re-prefill is forced by the weights, not by the restart
+
+What the caches hold is **K/V state**, not prompt text.  K/V is computed *by the model's weights*, so changing weights
+invalidates every cached conversation even though the tokens are identical.  A quant switch therefore costs a re-prefill
+**by construction**, and no cache design can dodge it.
+
+How expensive, measured on this conversation (the engine's own resume accounting):
+
+```
+prompt 229569 tokens = 229161 reused + 408 read in 1023 ms      6 checkpoints
+prompt 225340 tokens = 221823 reused + 3517 read in 2927 ms     (a history rewrite costs the rewrite, not the lot)
+after a restart:  prompt 195279 tokens, 88332 ms, nothing reused
+```
+
+So the warm path reads a few hundred tokens; cold reads ~2,200 tok/s, which is the 88 s.  The gap is the whole cost of a
+switch, and note that **restarting into the *same* quant pays it too** — the caches are RAM (`--prompt-cache` is "~118 MB
+of RAM each", `--conversation-cache-mib` is a "RAM budget"), so they die with the process whatever caused the death.
+
+The only disk-persisted path is the engine's `SAVE`/`RESTORE` session files (which require `--prompt-cache > 0`), and
+**the front end registers no route that reaches them** — `/health`, `/v1/health`, `/props`, `/models`, `/v1/models` and the
+completion/tokenize routes are all there is.  Today a conversation cannot survive a restart at all.
+
+**The design point that makes switching cheap in practice: cache per model, not per process.**  K/V is ~1.4 GB for a
+196k-token conversation (12 full-attention layers at 48 blocks / `full_attention_interval 4`, 2 KV heads of 256+256, q4_0),
+and the conversation cache budget here is 8192 MiB.  Keeping a cache *per quant* costs a couple of GB of a 62.5 GiB host,
+and it means a switch back to a model you were just running restores instantly: only the **first** visit to a quant pays
+the re-prefill.  Alternatives, worse to better:
+
+| approach | re-prefill? | note |
+| --- | --- | --- |
+| today | always, completely | caches are RAM; a restart kills them whatever the cause |
+| persist sessions to disk, restore same-model | avoided for a same-quant restart | needs an HTTP route that does not exist |
+| persist and restore **across** quants | avoided | structurally plausible, semantically wrong, error unmeasured |
+| cache per model, in RAM | avoided on the way back | ~1.4 GB each; the practical answer |
+| background re-prefill while idle | paid, but hidden | the first turn after a switch is warm instead of 88 s cold |
+
+### The one trap worth naming early
 
 `SAVE`/`RESTORE` write a **session file** containing per-layer running state — the K/V.  Structurally the two quants
 share geometry (same architecture, same vocabulary), so a session file from IQ3_XXS might load cleanly under IQ3_S.
