@@ -95,25 +95,21 @@ def resolve_target(name):
     sys.exit(f"unknown --gpu {name!r}; use 3090, 4070, or a full PCI id")
 
 
-def build(cfg, target, speed):
-    gpus = cfg.get("gpus") or {}
-    other = next((u for u in TARGETS.values() if u != target), None)
-    if target not in gpus:
-        sys.exit(f"{target} is not in {CONFIG} - refusing to guess where to put it")
-    if other and other not in gpus:
-        sys.exit(f"{other} is missing from the config - unexpected, refusing")
+def build(cfg, target, speed, labels):
     out = copy.deepcopy(cfg)
-    out["gpus"][target]["fan_control_enabled"] = True
-    out["gpus"][target]["fan_control_settings"] = {
-        "mode": "static",
-        "static_speed": speed,
-        "temperature_key": "vram",
-        "interval_ms": 1000,
-        "curve": {40: speed, 90: speed},
-        "spindown_delay_ms": 8000,
-        "change_threshold": 2,
-        "auto_threshold": 0,
-    }
+    for label in labels:
+        g = get_scope_container(out, target, label)
+        g["fan_control_enabled"] = True
+        g["fan_control_settings"] = {
+            "mode": "static",
+            "static_speed": speed,
+            "temperature_key": "edge",
+            "interval_ms": 1000,
+            "curve": {40: speed, 90: speed},
+            "spindown_delay_ms": 8000,
+            "change_threshold": 2,
+            "auto_threshold": 0,
+        }
     return out
 
 
@@ -262,15 +258,16 @@ def cmd_status(a):
 def cmd_pin(a):
     cfg = load()
     target = resolve_target(a.gpu)
+    labels = pick_scopes(cfg, target, a.scope)
+    out = build(cfg, target, a.speed, labels)
     if a.dry_run:
-        out = build(cfg, target, a.speed)
-        log(f"dry run - this is the {a.gpu} entry that would be written:")
-        log(yaml.safe_dump({target: out["gpus"][target]}, sort_keys=False).rstrip())
+        log(f"dry run - writing to {', '.join(labels)}; this is the {a.gpu} entry that would be written:")
+        for label in labels:
+            log(yaml.safe_dump({label: get_scope_container(out, target, label)}, sort_keys=False).rstrip())
         if not unchanged_others(cfg, out, target):
             return 1
         log("dry run: nothing written")
         return 0
-    out = build(cfg, target, a.speed)
     if not unchanged_others(cfg, out, target):
         return 1
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -293,7 +290,7 @@ def cmd_pin(a):
         open(CONFIG, "w", encoding="utf-8").write(original)
         restart()
         return 1
-    log(f"{a.gpu} pinned to {a.speed:.0%} static")
+    log(f"{a.gpu} pinned to {a.speed:.0%} static in {', '.join(labels)}")
     verify_fan(target)
     log("\nundo:")
     log(f"  sudo python3 {os.path.abspath(__file__)} restore")
@@ -355,15 +352,81 @@ def cmd_curve(a):
 def cmd_restore(a):
     bks = backups()
     if not bks:
-        sys.exit("no pin backups found")
-    src = bks[-1] if a.last else bks[0]
-    data = open(src, encoding="utf-8").read()
-    yaml.safe_load(data)
-    open(CONFIG, "w", encoding="utf-8").write(data)
-    os.chmod(CONFIG, 0o644)
-    log(f"restored {CONFIG} byte-for-byte from {src}")
-    restart()
-    verify_fan(resolve_target(a.gpu))
+        sys.exit(f"no backups found matching {os.path.dirname(CONFIG)}/{BACKUP_GLOB}")
+    if a.from_path:
+        src = a.from_path
+    elif a.last:
+        src = bks[-1]
+    elif a.scope != "full":
+        src = bks[-1]          # scoped restores want the most recent snapshot by default
+    else:
+        src = bks[0]
+    if not os.path.exists(src):
+        sys.exit(f"no such backup: {src}")
+    snap = yaml.safe_load(open(src, encoding="utf-8"))
+
+    if a.scope == "full":
+        data = open(src, encoding="utf-8").read()
+        if a.dry_run:
+            log(f"dry run: would restore {CONFIG} byte-for-byte from {src}")
+            return 0
+        open(CONFIG, "w", encoding="utf-8").write(data)
+        os.chmod(CONFIG, 0o644)
+        log(f"restored {CONFIG} byte-for-byte from {src}")
+        restart()
+        verify_fan(resolve_target(a.gpu))
+        return 0
+
+    # scoped restore: take only this GPU's entry, only in the named scope, out of the snapshot
+    live = load()
+    target = resolve_target(a.gpu)
+    labels = pick_scopes(live, target, a.scope)
+    out = copy.deepcopy(live)
+    for label in labels:
+        want = None
+        if label == "base":
+            want = (snap.get("gpus") or {}).get(target)
+        else:
+            name = label.split(":", 1)[1]
+            want = ((((snap.get("profiles") or {}).get(name) or {}).get("gpus")) or {}).get(target)
+        have = get_scope_container(live, target, label)
+        fw = (want or {}).get("fan_control_settings") or {}
+        fh = (have or {}).get("fan_control_settings") or {}
+        log(f"  {label}: key {fh.get('temperature_key')!r} -> {fw.get('temperature_key')!r}, "
+            f"curve {fh.get('curve')} -> {fw.get('curve')}")
+        if want is None:
+            log(f"  {label}: not present in {os.path.basename(src)} - leaving it alone")
+            continue
+        if label == "base":
+            out["gpus"][target] = copy.deepcopy(want)
+        else:
+            name = label.split(":", 1)[1]
+            out["profiles"][name].setdefault("gpus", {})[target] = copy.deepcopy(want)
+    if a.dry_run:
+        log(f"dry run: nothing written (snapshot {os.path.basename(src)})")
+        return 0
+    if not unchanged_others(live, out, target):
+        return 1
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak = f"{CONFIG}.preRestore-{stamp}"
+    original = open(CONFIG, encoding="utf-8").read()
+    open(bak, "w", encoding="utf-8").write(original)
+    os.chmod(bak, 0o600)
+    log(f"backup written and validated: {bak}")
+    try:
+        open(CONFIG, "w", encoding="utf-8").write(yaml.safe_dump(out, sort_keys=False))
+        yaml.safe_load(open(CONFIG, encoding="utf-8"))
+    except Exception as e:
+        log(f"write failed ({e}); restoring")
+        open(CONFIG, "w", encoding="utf-8").write(original)
+        return 1
+    if not restart():
+        log("daemon will not start - restoring the pre-restore snapshot")
+        open(CONFIG, "w", encoding="utf-8").write(original)
+        restart()
+        return 1
+    log(f"scope {', '.join(labels)} restored from {os.path.basename(src)}")
+    verify_fan(target)
     return 0
 
 
@@ -372,15 +435,18 @@ def main():
     ap.add_argument("command", choices=["status", "pin", "curve", "restore"])
     ap.add_argument("--preset", default="moderate", choices=sorted(CURVES),
                     help="with curve: which edge-unit preset to install")
-    ap.add_argument("--scope", default="active",
-                    help="curve: active (the scope the daemon reads - default), base, "
-                         "profile:<name>, or all (base + every profile, so a later profile switch cannot "
-                         "resurrect a stale curve)")
+    ap.add_argument("--scope", default=None,
+                    help="curve: active (default) / base / profile:<name> / all.  "
+                         "restore: full (default, whole file) / active / base / profile:<name>")
     ap.add_argument("--gpu", default="4070", help="3090, 4070, or a full PCI id (default 4070)")
     ap.add_argument("--speed", type=float, default=0.80, help="static fan speed, 0.20-1.00 (default 0.80)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--last", action="store_true", help="with restore: use the newest backup instead of the oldest")
+    ap.add_argument("--from", dest="from_path", metavar="FILE",
+                    help="with restore: use this backup file instead of picking one")
     a = ap.parse_args()
+    if a.scope is None:
+        a.scope = "full" if a.command == "restore" else "active"
     if a.speed < 0.2 or a.speed > 1.0:
         sys.exit("--speed must be between 0.20 and 1.00")
     return {"status": cmd_status, "pin": cmd_pin, "curve": cmd_curve, "restore": cmd_restore}[a.command](a)
