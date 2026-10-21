@@ -1,12 +1,25 @@
 # What is missing for model switching
 
+> **DECISION (2026-10-21): not being built.**  Switching by recreating the container is good enough, for two measured
+> reasons: the IQ3_XXS/IQ3_S decode delta is small (98.1 vs 88.9 tok/s at 262K, ~10%), and "more thinking" is available by
+> moving to a cloud model for that turn instead of reloading this one.  A switch would also cost a full re-prefill of the
+> conversation, which is 88 s on a long one - the same penalty as any restart, including a restart into the *same* quant.
+>
+> What would reopen it: wanting both quants **simultaneously** (which the hardware forbids: 42.9-50.3 GB of experts against
+> 24+12 GB VRAM and 62.5 GiB RAM with no swap), a third model worth switching between, or a client that cannot be pointed at
+> an endpoint by hand.  If it reopens, **Path A in §7.2 is 1.5-2 weeks of front-end work and needs no engine change**;
+> Path B (hot reload) is 5-8 weeks and should not be started to save 15 seconds.
+>
+> The one piece that is *not* optional and already exists: the endpoint names its model and refuses a wrong one
+> (`1218969`), so a stale `models.json` fails loudly with a 400 instead of being served silently by the other quant.
+
 **Question.** Two quants of the same model are on disk — IQ3_XXS (the agent config) and IQ3_S (the quality config) —
 and the service can only ever serve one of them.  Switching means recreating the container with different environment
 variables.  What would it take to make that a real, safe, discoverable switch?
 
-Short answer: **the naming layer is now correct, the weights are interchangeable in a way nobody expected, and the
-missing part is not in the front end at all — it is a reload path in the engine and a way for a client to learn which
-model is loaded.**
+Short answer: **the naming layer is correct, the two quants turn out to be the same model in every way that matters to
+the front end, and the missing part is a reload path in the engine plus a way for a client to learn which model is
+loaded — none of which is worth building today, for the reasons in the decision box above.**
 
 ---
 
@@ -283,3 +296,31 @@ it is also the part with the only real correctness question (conversation identi
 
 **Do not start Path B** unless something needs switching without a restart.  At 5-8 weeks against a shared init path that
 every upstream rebase touches, it is the most expensive way to save 15 seconds.
+
+---
+
+## 8. If a switch is ever done by hand
+
+Since the endpoint now refuses an unknown model, switching quants has one manual follow-up: **the id changes with the
+file**.  The sequence is:
+
+```
+# 1. switch the weights (container recreate; ~15 s to `loaded: true`)
+cd /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata
+STRATA_MODEL=/models/flash-next/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+STRATA_PACK=/models/pack-iq3-s docker compose up -d
+
+# 2. read back the id the server now advertises
+curl -s http://127.0.0.1:8080/v1/models | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"][0]["id"])'
+
+# 3. put that id in ~/.pi/agent/models.json (opening /model reloads it), or pin a name up front with
+#    STRATA_MODEL_ALIAS=<name> in the compose environment and use that name in models.json.
+```
+
+If step 3 is skipped the first request fails with a 400 naming both the requested and the served model - which is the
+intended behaviour, not a bug: the alternative was being answered by the other quant under the name you asked for.
+
+Keeping the alias stable across quants (`STRATA_MODEL_ALIAS=qwen-flash`) would remove step 3, at the cost of the name no
+longer saying which quant is loaded - exactly the ambiguity the naming work removed.  The compromise worth considering if
+this ever becomes frequent is an alias that encodes the quant (`qwen-flash-iq3-xxs`): stable enough to be a habit,
+explicit enough to be honest.
