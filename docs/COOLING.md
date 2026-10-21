@@ -595,6 +595,29 @@ Worth still testing, cheaply and separately, whether 40-series accepts VRAM at a
 contribution can be a *local* curve with the cross-card boost layered on top, or whether both temperatures have to be
 computed in the agent.
 
+### What moving the ceiling actually bought (and what it could not)
+
+Two identical 2-minute `matrixprod` runs, before and after moving the CPU curve's 100 % point from 75 C to 80 C:
+
+| | CPU peak / mean | clock | fan1 mean | peak RPM |
+| --- | --- | --- | --- | --- |
+| 100 % by 75 C | 81 / 78 C | 4201-4300 MHz | 98 % | 1744 |
+| 100 % by 80 C | 80 / 78 C | 4215-4300 MHz | 97 % | 1744 |
+
+**They converge under a solid synthetic load**, and the reason is structural: the CPU settles at 78-80 C, which *is* the
+new ceiling.  A ceiling at or below the settling temperature means 100 % duty at steady state whatever the curve above it
+looks like.  Flattening the top only helps at loads lighter than the soak:
+
+| CPU | 100 % @ 75 C | 100 % @ 80 C |
+| --- | --- | --- |
+| 72 C | 94 % / ~1660 RPM | 84 % / 1587 RPM |
+| 75 C | 100 % / 1744 | 90 % / 1656 |
+| 78 C | 100 % | 96 % / 1725 |
+
+That is the intended trade: **quieter at real working loads, unchanged at worst case.**  Real inference traffic on this
+box does not hold twenty threads in AVX-512 for minutes; it sits nearer 70-76 C, where the 6-16 saved duty points are
+audible.  The one clock dip in the second run (4256 and 4281 MHz against 4300) is turbo oscillation, not throttling.
+
 ### The fan calibration is optimistic under the filter
 
 `fan1` reads **1700-1744 RPM at 100 % duty**, against the calibration's 1771 maximum.  The calibration was measured with
