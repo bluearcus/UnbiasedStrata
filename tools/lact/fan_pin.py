@@ -25,7 +25,7 @@ USAGE (root)
   sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py pin --gpu 3090 --speed 0.35
   sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py restore
   sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py restore --last
-  sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py curve --gpu 3090 --preset moderate
+  sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/lact/fan_pin.py curve --gpu 3090 --preset moderate --scope active
 """
 import argparse
 import copy
@@ -166,7 +166,7 @@ def effective_scope(cfg, target):
 def pick_scopes(cfg, target, choice):
     """Resolve --scope into the set of scope labels to write."""
     all_labels = [lbl for lbl, _ in scopes(cfg, target)]
-    if choice == "auto":
+    if choice in ("active", "auto"):
         lbl, _ = effective_scope(cfg, target)
         if lbl is None:
             sys.exit(f"{target} has no fan settings anywhere in {CONFIG}")
@@ -372,8 +372,10 @@ def main():
     ap.add_argument("command", choices=["status", "pin", "curve", "restore"])
     ap.add_argument("--preset", default="moderate", choices=sorted(CURVES),
                     help="with curve: which edge-unit preset to install")
-    ap.add_argument("--scope", default="auto",
-                    help="curve: auto (the scope in effect), all, base, or profile:<name>")
+    ap.add_argument("--scope", default="active",
+                    help="curve: active (the scope the daemon reads - default), base, "
+                         "profile:<name>, or all (base + every profile, so a later profile switch cannot "
+                         "resurrect a stale curve)")
     ap.add_argument("--gpu", default="4070", help="3090, 4070, or a full PCI id (default 4070)")
     ap.add_argument("--speed", type=float, default=0.80, help="static fan speed, 0.20-1.00 (default 0.80)")
     ap.add_argument("--dry-run", action="store_true")
