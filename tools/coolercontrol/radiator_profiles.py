@@ -530,6 +530,92 @@ def cmd_retune(a):
     return 0
 
 
+def build_smooth(text, parsed, sensor_id):
+    """Point the CPU member of the radiator mix at a smoothed custom sensor instead of the raw package temperature.
+
+    Why: the raw Package id 0 sensor bounces ~13 C per second at idle as cores park and boost, and a graph curve turns
+    that into 24 points of duty - measured, at no load, oscillating with a ~3 s period.  The loop's thermal mass is tens
+    of seconds, so the sensor is what has to be filtered, not the fan.  CoolerControl does this with a custom sensor of
+    cs_type TimeAverage or ExponentialMovingAvg; this only repoints the profile at it.
+
+    Deliberately narrow: exactly one temp_source line changes, and the sensor is looked up and type-checked first so a
+    typo cannot silently leave the profile on the raw sensor.
+    """
+    sensors = {s.get("id"): s for s in (parsed.get("custom_sensors") or [])}
+    sens = sensors.get(sensor_id)
+    if sens is None:
+        avail = ", ".join(f"{k} ({v.get('cs_type')})" for k, v in sensors.items()) or "none"
+        sys.exit(f"REFUSED: no custom sensor {sensor_id!r}.  Available: {avail}")
+    if sens.get("cs_type") not in ("TimeAverage", "ExponentialMovingAvg"):
+        sys.exit(f"REFUSED: {sensor_id} is cs_type={sens.get('cs_type')!r}; this only points at a smoothing sensor")
+    window = sens.get("time_window_seconds")
+    profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
+    if CPU_RAD_UID not in profiles:
+        sys.exit("not applied yet: CPU (radiator) is absent.  Run 'apply' first.")
+    dev = next((d for d in parsed.get("devices", {}) if d.startswith("19e0")), None)
+    if dev is None:
+        sys.exit("REFUSED: cannot identify the custom-sensors device uid")
+    want = f'temp_source = {{ temp_name = "{sensor_id}", device_uid = "{dev}" }}'
+
+    lines = text.split("\n")
+    start = uid = None
+    changed = False
+    for i, line in enumerate(lines):
+        if line.startswith("["):
+            start, uid = i, None
+        elif start is not None and line.startswith("uid = "):
+            uid = line.split("=", 1)[1].strip().strip('"')
+        if uid == CPU_RAD_UID and line.startswith("temp_source = "):
+            log(f"  CPU (radiator) temp_source: {line.strip()}")
+            log(f"      -> {want}")
+            lines[i] = want
+            changed = True
+            uid = None
+    if not changed:
+        sys.exit(f"could not find the temp_source line of {CPU_RAD_UID}")
+    log(f"  smoothing sensor {sensor_id}: cs_type={sens.get('cs_type')} window={window}s "
+        f"(~{3 * (window or 0)}s to fully follow a sustained change)")
+    return "\n".join(lines)
+
+
+def cmd_smooth(a):
+    live = os.path.abspath(a.config) == os.path.abspath(CONFIG)
+    if live and daemon_active():
+        sys.exit("coolercontrold is RUNNING - stop it first: sudo systemctl stop coolercontrold")
+    text = read_config(a.config)
+    parsed = tomllib.loads(text)
+    patched = build_smooth(text, parsed, a.sensor)
+    after = tomllib.loads(patched)
+    got = next(p for p in after["profiles"] if p.get("uid") == CPU_RAD_UID)["temp_source"]
+    if got.get("temp_name") != a.sensor:
+        sys.exit(f"REFUSED: the patched config does not read back with {a.sensor} as the CPU source: {got}")
+    if a.dry_run:
+        log("dry run: nothing written")
+        return 0
+    bak = make_backup(a.config)
+    try:
+        open(a.config, "w", encoding="utf-8").write(patched)
+        tomllib.loads(open(a.config, encoding="utf-8").read())
+    except Exception as e:
+        log(f"write failed ({e}); rolling back")
+        shutil.copy2(bak, a.config)
+        return 1
+    if not daemon_check():
+        log("coolercontrold check FAILED - rolling back")
+        shutil.copy2(bak, a.config)
+        return 1
+    if a.start:
+        subprocess.run(["systemctl", "start", "coolercontrold"], capture_output=True)
+        if not daemon_active():
+            log("daemon refused to start - rolling back")
+            subprocess.run(["systemctl", "stop", "coolercontrold"], capture_output=True)
+            shutil.copy2(bak, a.config)
+            subprocess.run(["systemctl", "start", "coolercontrold"], capture_output=True)
+            return 1
+        log("coolercontrold started, CPU radiator curve now reads the smoothed sensor")
+    return 0
+
+
 def print_curves(text):
     """What the two radiator curves mean at the temperatures this CPU actually reaches."""
     parsed = tomllib.loads(text)
@@ -558,13 +644,14 @@ def cmd_backups(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["plan", "apply", "retune", "revert", "backups"])
+    ap.add_argument("command", choices=["plan", "apply", "retune", "smooth", "revert", "backups"])
     ap.add_argument("--config", default=CONFIG)
+    ap.add_argument("--sensor", default="", help="with smooth: the custom sensor id to read for the CPU member")
     ap.add_argument("--dry-run", action="store_true", help="with retune: print the change, write nothing")
     ap.add_argument("--start", action="store_true")
     ap.add_argument("--show", action="store_true")
     a = ap.parse_args()
-    return {"plan": cmd_plan, "apply": cmd_apply, "retune": cmd_retune, "revert": cmd_revert,
+    return {"plan": cmd_plan, "apply": cmd_apply, "retune": cmd_retune, "smooth": cmd_smooth, "revert": cmd_revert,
             "backups": cmd_backups}[a.command](a)
 
 
