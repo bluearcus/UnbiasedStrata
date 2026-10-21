@@ -159,10 +159,31 @@ std::string file_stem(const std::string & path) {
     if (dot != std::string::npos) {
         name.erase(dot);
     }
+    // llama.cpp split files are named <model>-NNNNN-of-NNNNN.gguf.  A model id names the model, not the shard, so the
+    // suffix comes off; "Qwen3.8-...-IQ3_XXS-00001-of-00002" would otherwise be advertised as the model.
+    const size_t of = name.rfind("-of-");
+    if (of != std::string::npos) {
+        const auto digits = [](const std::string & s) {
+            if (s.empty()) return false;
+            for (const char c : s) if (c < '0' || c > '9') return false;
+            return true;
+        };
+        const std::string tail = name.substr(of + 4);
+        const size_t      dash = name.rfind('-', of == 0 ? 0 : of - 1);
+        if (dash != std::string::npos && dash < of && digits(tail) && digits(name.substr(dash + 1, of - dash - 1))) {
+            name.erase(dash);
+        }
+    }
     return name;
 }
 
 } // namespace
+
+// declared in strata_context.hpp: the same stem used for the front end's own model id, so the name advertised on
+// /v1/models and the name derived in main.cpp are produced by one function
+std::string strata_model_stem(const std::string & path) {
+    return file_stem(path);
+}
 
 struct strata_context_impl {
     common_params params;
@@ -186,6 +207,8 @@ struct strata_context_impl {
 
     std::string model_name;
     std::string model_path;
+    // every name a client may put in the OpenAI "model" field for this server (see require_model)
+    std::vector<std::string> model_ids;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -867,6 +890,41 @@ struct strata_context_impl {
         };
     }
 
+    // A chat template raising is a client error, but llama.cpp reports it wrapped in a Jinja traceback.  When the
+    // template's own sentence is in there, hand the client that and drop the machinery around it.
+    static std::string client_message(const std::string & what) {
+        // rfind, not find: the traceback first shows the template *source* containing this phrase, then the rendered message
+        const size_t at = what.rfind("Unexpected reasoning effort");
+        if (at == std::string::npos) {
+            return what;
+        }
+        const size_t end = what.find('\n', at);
+        return what.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    }
+
+    // An endpoint that answers with whatever it happens to have loaded, whatever the client asked for, is not a model
+    // endpoint.  A client naming a model that is not here must be told, not quietly served by a different model - the
+    // failure is invisible in the response and visible only in the answers.  This server hosts one model, so it names
+    // it and refuses the rest.  A missing or empty "model" stays accepted: llama.cpp's own clients omit it.
+    std::unique_ptr<res_generator> model_error(const json & body) {
+        if (!body.contains("model") || !body.at("model").is_string()) {
+            return nullptr;
+        }
+        const std::string want = body.at("model").get<std::string>();
+        if (want.empty() || std::find(model_ids.begin(), model_ids.end(), want) != model_ids.end()) {
+            return nullptr;
+        }
+        std::string listed;
+        for (const auto & id : model_ids) {
+            if (!listed.empty()) listed += ", ";
+            listed += id;
+        }
+        auto res = create_response();
+        res->error(format_error_response("unknown model \"" + want + "\"; this server serves " + listed,
+                                        ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
     // mirrors handle_completions_impl in server-context.cpp without the parts the engine has no use for
     // (n_cmpl > 1, prompt logging, message spans for checkpoints)
     std::unique_ptr<res_generator> handle_completions(const server_http_req & req, const json & data,
@@ -1085,6 +1143,16 @@ bool strata_context::load(common_params & params, std::string & err) {
     I.vocab      = llama_model_get_vocab(I.model);
     I.model_path = params.model.path;
     I.model_name = params.model_alias.empty() ? file_stem(params.model.path) : *params.model_alias.begin();
+    for (const auto & alias : params.model_alias) {
+        I.model_ids.push_back(alias);
+    }
+    // llama.cpp's own clients, and every test in frontend/tests, name the file rather than an alias: keep the path and
+    // its stem answerable so the check below rejects the wrong model, not the conventional way of naming this one.
+    for (const auto & id : { file_stem(params.model.path), params.model.path }) {
+        if (std::find(I.model_ids.begin(), I.model_ids.end(), id) == I.model_ids.end()) {
+            I.model_ids.push_back(id);
+        }
+    }
 
     if (!params.mmproj.path.empty()) {
         if (!I.init_vision(params, err)) {
@@ -1250,16 +1318,36 @@ void strata_context::init_routes(server_http_context & http) {
     };
 
     auto post_chat_completions = [I](const server_http_req & req) {
+        auto res = I->create_response();
         std::vector<raw_buffer> files;
-        json body = json::parse(req.body);
-        json body_parsed = oaicompat_chat_params_parse(body, I->chat_params, files);
-        return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT);
+        try {
+            json body = json::parse(req.body);
+            if (auto bad = I->model_error(body)) {
+                return bad;
+            }
+            json body_parsed = oaicompat_chat_params_parse(body, I->chat_params, files);
+            return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT);
+        } catch (const std::exception & e) {
+            // a request the template rejects - an unsupported reasoning_effort, for instance - is the client's error,
+            // not the server's: llama.cpp raises these from inside chat-template rendering, which lands here
+            res->error(format_error_response(strata_context_impl::client_message(e.what()), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
     };
 
     auto post_completions_oai = [I](const server_http_req & req) {
+        auto res = I->create_response();
         std::vector<raw_buffer> files;
-        const json body = json::parse(req.body);
-        return I->handle_completions(req, body, files, TASK_RESPONSE_TYPE_OAI_CMPL);
+        try {
+            const json body = json::parse(req.body);
+            if (auto bad = I->model_error(body)) {
+                return bad;
+            }
+            return I->handle_completions(req, body, files, TASK_RESPONSE_TYPE_OAI_CMPL);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
     };
 
     auto post_completions = [I](const server_http_req & req) {
@@ -1271,10 +1359,18 @@ void strata_context::init_routes(server_http_context & http) {
     auto post_apply_template = [I](const server_http_req & req) {
         auto res = I->create_response();
         std::vector<raw_buffer> files;
-        json body = json::parse(req.body);
-        json data = oaicompat_chat_params_parse(body, I->chat_params, files);
-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
-        return res;
+        try {
+            json body = json::parse(req.body);
+            if (auto bad = I->model_error(body)) {
+                return bad;
+            }
+            json data = oaicompat_chat_params_parse(body, I->chat_params, files);
+            res->ok({{ "prompt", std::move(data.at("prompt")) }});
+            return res;
+        } catch (const std::exception & e) {
+            res->error(format_error_response(strata_context_impl::client_message(e.what()), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
     };
 
     auto post_tokenize = [I](const server_http_req & req) {

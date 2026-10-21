@@ -144,9 +144,14 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "unbiased-strata: -m <model.gguf> is required (the vocabulary and chat template come from it)\n");
         return 2;
     }
-    auto model_name = params.model.get_name();
-    if (params.model_alias.empty() && !model_name.empty()) {
-        params.model_alias.insert(model_name);
+    // /v1/models advertises model_alias[0], and leaving the alias unset makes llama.cpp report the model's path as the
+    // model id - a filesystem location where a client expects a name.  Derive the name from the file instead.
+    // --alias overrides this, and may be repeated (every alias given is then accepted in requests).
+    if (params.model_alias.empty()) {
+        const std::string derived = strata_model_stem(params.model.path);
+        if (!derived.empty()) {
+            params.model_alias.insert(derived);
+        }
     }
 
     llama_backend_init();

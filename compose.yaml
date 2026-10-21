@@ -8,6 +8,11 @@
 # the command line:
 #   STRATA_MODEL=/models/flash-next/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
 #   STRATA_PACK=/models/pack-iq3-s docker compose up -d
+#
+# Model id: the endpoint answers for one model, and the OpenAI `model` field is checked against it - naming a model
+# that is not loaded is a 400, not a silent answer from whatever happens to be running.  The id defaults to the model
+# file's stem (split-shard suffix removed), so it is `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` here and changes with the
+# quant above; STRATA_MODEL_ALIAS overrides it, and whatever /v1/models reports is what clients must send.
 name: strata
 
 services:
@@ -31,6 +36,9 @@ services:
       STRATA_KV: ${STRATA_KV:-q4_0}
       STRATA_PEER_DEVICE: ${STRATA_PEER_DEVICE:-1}
       STRATA_API_KEY: ${STRATA_API_KEY:-}
+      # Empty means: derive the model id from STRATA_MODEL's file stem.  Set it to pin a shorter name; it must name
+      # the model that is actually loaded, because requests naming anything else are refused.
+      STRATA_MODEL_ALIAS: ${STRATA_MODEL_ALIAS:-}
       # Conversation cache: park other conversations in RAM so switching between them does not re-read the
       # whole prompt (measured: a 115k-token conversation costs 50 s cold, 0.48 s when parked).  The floor
       # stops parking when the host gets tight.  The VRAM reserve is the engine's own advice for the 262K

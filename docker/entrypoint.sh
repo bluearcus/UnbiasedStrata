@@ -18,6 +18,7 @@ KV=${STRATA_KV:-q4_0}
 ENGINE=${STRATA_ENGINE:-/opt/strata/strata}
 PEER=${STRATA_PEER_DEVICE-1}          # empty string disables the peer tier; unset means 1
 SHIM=${STRATA_SHIM:-/opt/strata/strata-dual}
+ALIAS=${STRATA_MODEL_ALIAS:-}         # empty: the front end derives the model id from the file stem
 
 for f in "$MODEL" "$PACK" "$MTP"; do
   [ -e "$f" ] || { echo "entrypoint: not found: $f (is /home/mike/models mounted at /models?)" >&2; exit 2; }
@@ -26,6 +27,7 @@ done
 args=(--engine "$ENGINE" -m "$MODEL" --host 0.0.0.0 --port "$PORT"
       --pack "$PACK" --mtp "$MTP")
 [ -n "$PEER" ] && args+=(--peer-device "$PEER")
+[ -n "$ALIAS" ] && args+=(--alias "$ALIAS")
 
 engine_args=(--max-context "$CTX" --kv "$KV")
 # Extra engine flags, space separated, for experiments (e.g. STRATA_EXTRA="--resident-experts").

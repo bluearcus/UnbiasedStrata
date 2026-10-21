@@ -37,6 +37,21 @@ h=$(curl -s "$URL/health"); check $([ "$(echo "$h" | j 'd["status"]')" = ok ] &&
 check $([ "$(echo "$h" | j 'd["service"]')" = strata ] && [ "$(echo "$h" | j 'd["loaded"]')" = true ] && echo 0 || echo 1) "/health: service=strata loaded=true"
 m=$(curl -s "$URL/v1/models"); check $([ "$(echo "$m" | j 'd["data"][0]["id"]')" = fake ] && echo 0 || echo 1) "/v1/models id: $(echo "$m" | j '{k: d["data"][0].get(k) for k in ("id", "context_length")}')"
 
+# The OpenAI "model" field is checked, not ignored.  Naming a model this server does not serve must be a 400 that
+# names what it does serve: a silently-served wrong model is invisible in the response and visible only in the answers.
+BAD=$(mktemp "${TMPDIR:-/tmp}/us2-e2e-badmodel-XXXXXX")
+code=$(curl -s -o "$BAD" -w '%{http_code}' "$URL/v1/chat/completions" -H 'content-type: application/json' \
+      -d '{"model":"some-other-model","messages":[{"role":"user","content":"Say hello"}],"max_tokens":8}')
+check $([ "$code" = 400 ] && grep -q 'some-other-model' "$BAD" && grep -q 'fake' "$BAD" && curl -s "$URL/health" | grep -q '"status":"ok"' && echo 0 || echo 1) \
+      "unknown model id -> $code: $(j 'd[\"error\"][\"message\"]' < "$BAD" | cut -c1-96); server alive"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/v1/chat/completions" -H 'content-type: application/json' \
+      -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":8,"temperature":0}')
+check $([ "$code" = 200 ] && echo 0 || echo 1) "chat with no model field -> $code (llama.cpp's own clients omit it)"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/v1/completions" -H 'content-type: application/json' \
+      -d '{"model":"some-other-model","prompt":"Say hello","max_tokens":8}')
+check $([ "$code" = 400 ] && echo 0 || echo 1) "/v1/completions with an unknown model id -> $code"
+rm -f "$BAD"
+
 # non-streaming chat
 r=$(curl -s "$URL/v1/chat/completions" -H 'content-type: application/json' -d '{"model":"fake","messages":[{"role":"user","content":"Say hello"}],"max_tokens":32,"temperature":0}')
 content=$(echo "$r" | j 'd["choices"][0]["message"]["content"]')

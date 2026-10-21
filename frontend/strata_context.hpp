@@ -18,6 +18,10 @@
 struct common_params;
 struct strata_context_impl;
 
+// The model id the front end derives from a GGUF path: file stem, no ".gguf", no llama.cpp "-NNNNN-of-NNNNN" split-shard
+// suffix.  Exposed so main.cpp and the front end cannot end up advertising two different names for one model.
+std::string strata_model_stem(const std::string & path);
+
 struct strata_context {
     std::unique_ptr<strata_context_impl> impl;
 
