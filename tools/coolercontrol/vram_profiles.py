@@ -25,14 +25,14 @@ CPU-sourced profile first - see docs/COOLING.md.  fan1 is the AIO radiator and f
 CURVE FLOORS come from calibrations.json: fan5 will not start below 20% duty, fan6 not below 30%.  A curve that
 commands less than that parks the fan, and a stopped exhaust is worse than a slow one.
 
-USAGE (root, daemon stopped)
+USAGE (root, daemon stopped).  Absolute paths so they paste into any shell:
   sudo systemctl stop coolercontrold
-  sudo python3 tools/coolercontrol/vram_profiles.py plan
-  sudo python3 tools/coolercontrol/vram_profiles.py apply
+  sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/vram_profiles.py plan
+  sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/vram_profiles.py apply --start
   sudo systemctl start coolercontrold
   ...
   sudo systemctl stop coolercontrold
-  sudo python3 tools/coolercontrol/vram_profiles.py revert
+  sudo python3 /home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol/vram_profiles.py revert
   sudo systemctl start coolercontrold
 """
 import argparse
@@ -339,7 +339,7 @@ def cmd_apply(a):
 
     log("\napplied.  To undo:")
     log(f"  sudo systemctl stop coolercontrold")
-    log(f"  sudo python3 {os.path.basename(__file__)} revert")
+    log(f"  sudo python3 {os.path.abspath(__file__)} revert")
     log(f"  sudo systemctl start coolercontrold")
     return 0
 

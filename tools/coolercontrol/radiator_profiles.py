@@ -66,7 +66,11 @@ GPU_RAD_UID = "b7e24c19-5a3d-4f81-9c06-2d1b7e90a342"
 RAD_MIX_UID = "b7e24c19-5a3d-4f81-9c06-2d1b7e90a343"
 
 # Written in fan1's units: duty is a fraction of its 641..1771 RPM range, so these stay low.
-CPU_RAD_CURVE = [[40.0, 2], [50.0, 6], [60.0, 14], [70.0, 26], [80.0, 40], [90.0, 55]]
+# THE CPU HALF MUST BE ABLE TO MAX THE PAIR.  A previous version of this curve topped out at 55% at 90 C, which on
+# fan1's calibration (641 RPM start, so duty is a fraction of its RPM range) is only ~958 of 1771 RPM: a CPU at 95 C
+# could not spin the fans that dump its heat past half.  That is a safety defect, not a taste question, and the guard
+# in check_cpu_ceiling() now refuses a curve that reintroduces it.  This one is at 100% by 75 C.
+CPU_RAD_CURVE = [[40.0, 2], [45.0, 10], [50.0, 22], [55.0, 38], [60.0, 55], [65.0, 72], [70.0, 90], [75.0, 100], [95.0, 100]]
 # The radiator pair does not ramp for the 3090 at all until 70 C.  Its fans idle at 641 RPM whatever the duty, so a
 # flat 2% below 70 C costs nothing and stops the memory's resting temperature spinning them.
 GPU_RAD_CURVE = [[45.0, 2], [70.0, 2], [78.0, 12], [85.0, 25], [92.0, 40]]
@@ -253,6 +257,62 @@ function_uid = "0"
     return join_segments(segs)
 
 
+def check_cpu_ceiling(curve):
+    """Refuse a CPU curve that cannot reach 100%, or that is not already there by a temperature a loaded 10900X reaches.
+
+    This exists because the curve that shipped at first capped out at 55% and nothing stopped it - the fans that carry
+    the CPU's heat were unable to run at full speed at any CPU temperature.
+    """
+    top = max(v for _, v in curve)
+    if top < 100.0:
+        sys.exit(f"REFUSED: the CPU radiator curve peaks at {top:.0f}%, so the pair can never run at full speed. "
+                 f"It must reach 100%.")
+    at75 = curve_at(curve, 75.0)
+    if at75 < 100.0:
+        sys.exit(f"REFUSED: the CPU curve is only {at75:.0f}% at 75 C; it must be at 100% by then (a loaded "
+                 f"i9-10900X on this AIO sits above that, and the radiator fans are what move the heat out).")
+    log(f"CPU ceiling check: 100% by 75 C ({curve_at(curve, 75.0):.0f}% at 75 C, {top:.0f}% maximum)")
+
+
+def build_retune(text, parsed):
+    """Rewrite the member curves of an already-applied radiator mix, touching those two lines and nothing else.
+
+    The apply path refuses to run twice, and reverting first would put fan1 back on the shared case-fan mix for the
+    duration - the noisy state this design removed.
+
+    Deliberately NOT built on split_segments(): that splitter hands trailing blank and comment lines to the *next*
+    table (so a comment stays with what it describes), which means re-joining it reflows those blank lines.  Byte-exact
+    elsewhere is worth more here than reusing the helper, so this finds each table by its uid and rewrites one line.
+    """
+    check_cpu_ceiling(CPU_RAD_CURVE)
+    profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
+    if RAD_MIX_UID not in profiles:
+        sys.exit("not applied yet: the radiator mix is absent.  Run 'apply' instead of 'retune'.")
+    want = {CPU_RAD_UID: CPU_RAD_CURVE, GPU_RAD_UID: GPU_RAD_CURVE}
+
+    lines = text.split("\n")
+    done = {}
+    table_start = None
+    table_uid = None
+    for i, line in enumerate(lines):
+        if line.startswith("["):
+            table_start, table_uid = i, None
+        elif table_start is not None and line.startswith("uid = "):
+            table_uid = line.split("=", 1)[1].strip().strip('"')
+        if table_uid in want and table_start is not None and line.startswith("speed_profile = "):
+            old = line
+            lines[i] = f"speed_profile = {want[table_uid]}"
+            done[table_uid] = (old.strip(), lines[i])
+            table_uid = None if table_uid not in done else table_uid
+    if set(done) != set(want):
+        missing = [profiles[u].get("name") for u in set(want) - set(done)]
+        sys.exit(f"could not find the speed_profile line for {missing}")
+    for uid, (before, after) in done.items():
+        log(f"  {profiles[uid].get('name')}: {before.split('=', 1)[1].strip()}")
+        log(f"      -> {after.split('=', 1)[1].strip()}")
+    return "\n".join(lines)
+
+
 def predict(parsed):
     profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
     log("\nwhat the profiles actually mean on fan1 (calibration-inverted):")
@@ -382,6 +442,7 @@ def cmd_plan(a):
 
 
 def cmd_apply(a):
+    check_cpu_ceiling(CPU_RAD_CURVE)
     if daemon_active():
         sys.exit("coolercontrold is RUNNING - stop it first: sudo systemctl stop coolercontrold")
     text = read_config(a.config)
@@ -419,6 +480,71 @@ def cmd_apply(a):
     return 0
 
 
+def cmd_retune(a):
+    """Rewrite the radiator curves on an already-applied config, with the same contract as apply."""
+    live = os.path.abspath(a.config) == os.path.abspath(CONFIG)
+    if live and daemon_active():
+        sys.exit("coolercontrold is RUNNING - stop it first: sudo systemctl stop coolercontrold")
+    text = read_config(a.config)
+    try:
+        parsed = tomllib.loads(text)
+    except Exception as e:
+        sys.exit(f"the CURRENT config does not parse ({e}) - look before editing anything")
+    patched = build_retune(text, parsed)
+    print_curves(patched)
+    if a.dry_run:
+        log("dry run: nothing written")
+        return 0
+    if live and daemon_active():
+        sys.exit("coolercontrold started while this was running - stop it and retry")
+    bak = make_backup(a.config)
+    try:
+        open(a.config, "w", encoding="utf-8").write(patched)
+        after = tomllib.loads(open(a.config, encoding="utf-8").read())
+    except Exception as e:
+        log(f"write failed ({e}); rolling back")
+        shutil.copy2(bak, a.config)
+        return 1
+    got = {p.get("uid"): p.get("speed_profile") for p in after.get("profiles", [])}
+    if got.get(CPU_RAD_UID) != CPU_RAD_CURVE or got.get(GPU_RAD_UID) != GPU_RAD_CURVE:
+        log("the written curves do not read back as intended - rolling back")
+        shutil.copy2(bak, a.config)
+        return 1
+    if not daemon_check():
+        log("coolercontrold check FAILED - rolling back")
+        shutil.copy2(bak, a.config)
+        return 1
+    if a.start:
+        subprocess.run(["systemctl", "start", "coolercontrold"], capture_output=True)
+        if not daemon_active():
+            log("daemon refused to start with the new curves - rolling back and restarting on the old ones")
+            subprocess.run(["systemctl", "stop", "coolercontrold"], capture_output=True)
+            shutil.copy2(bak, a.config)
+            subprocess.run(["systemctl", "start", "coolercontrold"], capture_output=True)
+            return 1
+        log("coolercontrold started with the new curves")
+    log("\nretuned.  To undo:")
+    log("  sudo systemctl stop coolercontrold")
+    log(f"  sudo python3 {os.path.abspath(__file__)} revert")
+    log("  sudo systemctl start coolercontrold")
+    return 0
+
+
+def print_curves(text):
+    """What the two radiator curves mean at the temperatures this CPU actually reaches."""
+    parsed = tomllib.loads(text)
+    profiles = {p.get("uid"): p for p in parsed.get("profiles", [])}
+    log("\nfan1 duty the CPU curve now asks for (and the RPM that means on this fan):")
+    for t in (40, 50, 60, 66, 72, 78, 84, 90):
+        d = curve_at(profiles[CPU_RAD_UID]["speed_profile"], t)
+        raw, rpm = duty_to_rpm("fan1", d)
+        log(f"   CPU {t:3d}C -> {d:5.1f}% duty -> {rpm or 0:5.0f} RPM")
+    top = max(p[1] for p in profiles[CPU_RAD_UID]["speed_profile"])
+    log(f"   CPU curve maximum: {top:.0f}% duty ({duty_to_rpm('fan1', top)[1] or 0:.0f} RPM)")
+    log("   GPU curve maximum: %.0f%% duty (unchanged: the 3090 must not push this pair into the 70s)"
+        % max(p[1] for p in profiles[GPU_RAD_UID]["speed_profile"]))
+
+
 def cmd_revert(a):
     if daemon_active():
         sys.exit("coolercontrold is RUNNING - stop it first.")
@@ -432,12 +558,14 @@ def cmd_backups(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["plan", "apply", "revert", "backups"])
+    ap.add_argument("command", choices=["plan", "apply", "retune", "revert", "backups"])
     ap.add_argument("--config", default=CONFIG)
+    ap.add_argument("--dry-run", action="store_true", help="with retune: print the change, write nothing")
     ap.add_argument("--start", action="store_true")
     ap.add_argument("--show", action="store_true")
     a = ap.parse_args()
-    return {"plan": cmd_plan, "apply": cmd_apply, "revert": cmd_revert, "backups": cmd_backups}[a.command](a)
+    return {"plan": cmd_plan, "apply": cmd_apply, "retune": cmd_retune, "revert": cmd_revert,
+            "backups": cmd_backups}[a.command](a)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,25 @@
+#!/bin/sh
+# Short entry point for one of the CoolerControl config scripts.  First argument is the script: rad|vram|mix.
+# They edit /etc/coolercontrol/config.toml, which is root-owned, so this elevates when it is not already root - and says
+# so, because silently gaining root is worse than a password prompt.  --help runs unprivileged (it writes nothing).
+set -u
+which=${1:-}
+[ -n "$which" ] || { echo "usage: $(basename "$0") {rad|vram|mix} <plan|apply|retune|revert|backups> [options]" >&2; exit 2; }
+shift
+DIR=/home/mike/Sync/Projects/StrataUnbiasedDualGPU/UnbiasedStrata/tools/coolercontrol
+case "$which" in
+  rad)  SCRIPT=$DIR/radiator_profiles.py ;;   # fan1: the AIO radiator pair's CPU/VRAM curves
+  vram) SCRIPT=$DIR/vram_profiles.py ;;       # fan5/fan6: the VRAM-keyed channels
+  mix)  SCRIPT=$DIR/mix_profiles.py ;;        # fan3/fan4/fan6: the case-fan CPU-or-VRAM mix
+  *)    echo "$(basename "$0"): unknown script '$which' (use rad, vram or mix)" >&2; exit 2 ;;
+esac
+[ -f "$SCRIPT" ] || { echo "$(basename "$0"): missing $SCRIPT" >&2; exit 2; }
+
+for a in "$@"; do
+  case "$a" in -h|--help) exec python3 "$SCRIPT" "$@" ;; esac
+done
+if [ "$(id -u)" -ne 0 ]; then
+  echo "$(basename "$0"): needs root to edit /etc/coolercontrol/config.toml - elevating with sudo" >&2
+  exec sudo python3 "$SCRIPT" "$@"
+fi
+exec python3 "$SCRIPT" "$@"
