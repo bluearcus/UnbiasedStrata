@@ -27,7 +27,8 @@ the prose further down is background.
 | O7 | Calibrate `fan1` — **done**: starts spinning at **0% duty**, max **1771 RPM**, so it cannot be parked | you, GUI | closed |
 | O8 | `fan1` under automatic control — **done**, but on its own profiles, not the shared mix (see "Radiator pair and exhaust balance"). Mean exhaust speed fell 15-21% for a mean VRAM change of **-0.5 C** | assistant | closed |
 | O9 | **4070 as a backplate blower** — **done, it works**: pinned to 80% static (2715 RPM) the 3090's VRAM settles **2.4 C lower** (76.2 → 73.8 C) and peaks 4 C lower, with every case fan and the 3090's own fan *slower*. Detail and caveats below | assistant | closed, see "O9" |
-| O11 | **The 3090's own fan curve may not be keyed on VRAM at all.**  Under sustained load the card's fans track `curve(edge)` to within 1-2 points and `curve(vram)` not at all: 47% actual against a predicted 79%.  Either LACT is keying on the wrong sensor, or it is not driving that card and the BIOS is.  Settle it with one command: `fan_pin.py pin --gpu 3090 --speed 0.35` — if `nvidia-smi` then reports 35%, LACT is in control and only the key is wrong; if the fan ignores it, every curve on that card is decoration | you, one root command | O9 follow-up |
+| O11 | **The 3090's fan curve is keyed on edge temp, and the curve's useful band is outside where the card operates.**  Edge saturates at 56-57 C while VRAM climbs 72->74 at full load, and the current curve only reaches 100% at edge 80 C, so it self-caps near 50%.  Fix is a curve compressed into the edge band the card actually uses, or a hotspot key (hotspot tracks VRAM within 4 C, edge within 12-18 C).  **Confirm LACT owns that fan** first: set the curve flat to 0.45 in the GUI and see whether idle fan moves 30% -> 45% | you, GUI | needs one observation |
+| O12 | **Summer plan**: a steeper curve on the 3090 instead of the 4070 at 80%.  Two candidate curves are written up below (moderate 48-76% across the working band, aggressive 55-91%); which is right depends on the **fan-to-VRAM response**, still unmeasured — the sweep steps the fan 50/60/70% under load and reads VRAM | you decide | O11 |
 | O12 | **Summer plan**: rather than the 4070 at 80% (which was unacceptably loud), a steeper curve on the 3090 itself — noted from your listening test, to be settled *after* O11, since the useful curve depends on which sensor is actually driving that fan | you decide | O11 |
 | O10 | **Decide how the 4070's boost should be triggered.** Constant 80% is too loud for a card that is otherwise silent, and LACT can only key a card's curve on *its own* sensors, so this needs cross-card logic (a small daemon that reads the 3090's VRAM temp and pins/drops the 4070). Not started by design: it needs your call on the noise policy. Also unmeasured: **where the knee is** — 80% was picked arbitrarily, and a 40/55/70% sweep would find the cheapest speed that still helps | you decide | O9 measured |
 | O3 | If the soak shows VRAM never reaching 75–85 °C, raise the intake curve (`55→40, 62→55, 70→75, 78→90, 85→100`) | assistant | outcome of O2 |
@@ -455,6 +456,43 @@ Two possible explanations, and they matter differently:
 The discriminator is a static pin, which no curve can imitate — `fan_pin.py pin --gpu 3090 --speed 0.35` and read
 `nvidia-smi`.  Not run yet; it needs one root command, and it is worth doing before touching any 3090 curve because it
 says which of the two problems we actually have.
+
+
+### The sensor question, answered by measurement
+
+Same run, all three NVIDIA sensors, versus the aggregate VRAM reading:
+
+| t | edge | hotspot | VRAM | VRAM − edge | VRAM − hotspot |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 27 | 36 | 40 | +13 | +4 |
+| 61 | 53 | 64 | 62 | +9 | −2 |
+| 121 | 56 | 68 | 70 | +14 | +2 |
+| 161 | 56 | 68 | 74 | **+18** | +6 |
+| 201 | 56 | 68 | 74 | **+18** | +6 |
+
+**Edge saturates and stops reporting.**  Between t=141 and t=201 the edge sensor sits flat at 56-57 C while VRAM rises
+72 -> 74 C.  Hotspot is not perfect either (it flattens at 68 C) but it tracks VRAM within 0-6 C instead of 12-18 C.
+
+That explains the whole observation without needing a bug: **the curve is being applied, in edge units, and its useful
+band lies outside where this card operates.**  The curve reaches 100% at edge 80 C.  Under sustained inference edge
+never exceeds 57 C, so the curve is stuck between 39% and 50% forever - which is exactly the 47-48% measured.
+
+| edge | current curve | moderate | aggressive |
+| --- | --- | --- | --- |
+| 49 C | 39 % | 48 % | 55 % |
+| 53 C | 44 % | 60 % | 72 % |
+| 56 C | 49 % | 72 % | 88 % |
+| 57 C | 50 % | 76 % | 91 % |
+
+```
+moderate    40:0.30  45:0.38  50:0.50  53:0.60  56:0.72  60:0.90
+aggressive  40:0.30  45:0.42  50:0.58  53:0.72  56:0.88  60:1.00
+```
+
+Both keep the 30% floor below 40 C so idling stays silent.  Which one is right cannot be settled by reading curves: the
+missing measurement is **fan percent to VRAM degrees**, i.e. step the fan to 50/60/70% under sustained load and read
+the VRAM plateau at each.  That sweep is what the summer decision needs, and it is the same measurement that would tell
+us the 4070's knee (O10).
 
 **Consequence for the summer plan (O12).**  If explanation 1 holds, the honest headroom is larger than it looks: the
 card is sitting at ~48 % fan with VRAM at 74 C, and a curve keyed to VRAM would be asking for 85 % there.  Somewhere
